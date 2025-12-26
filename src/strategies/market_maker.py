@@ -1,13 +1,15 @@
-
 import asyncio
 import logging
 from typing import Dict, List, Optional
-from src.core.feed import MarketDataFeed
-from src.core.orderbook import OrderBook
+
+import aiohttp
+
 from src.core.feed import MarketDataFeed
 from src.core.orderbook import OrderBook
 from src.exchanges.polymarket_clob import PolymarketOrderExecutor
-import aiohttp
+
+logger = logging.getLogger(__name__)
+
 
 class SimpleMarketMaker:
     """
@@ -17,151 +19,181 @@ class SimpleMarketMaker:
     - Calculates Quotes around Mid-Price.
     - Executes LIMIT orders (if dry_run=False).
     """
-    
-    def __init__(self, token_ids: List[str], executor: Optional[PolymarketOrderExecutor] = None, dry_run: bool = True, spread: float = 0.02, size: float = 10.0):
+
+    def __init__(
+        self,
+        token_ids: List[str],
+        executor: Optional[PolymarketOrderExecutor] = None,
+        dry_run: bool = True,
+        spread: float = 0.02,
+        size: float = 10.0,
+    ):
         self.token_ids = token_ids
         self.executor = executor
         self.dry_run = dry_run
-        self.spread = spread # 2 cents spread
+        self.spread = spread  # 2 cents spread by default
         self.size = size
         self.books: Dict[str, OrderBook] = {tid: OrderBook(tid) for tid in token_ids}
         self.feed = MarketDataFeed()
         self.feed.add_callback(self.on_market_update)
-        
+
         # Track our open orders: TokenID -> {'BID': order_id, 'ASK': order_id}
         self.active_orders: Dict[str, Dict[str, str]] = {tid: {} for tid in token_ids}
+
     async def start(self):
-        print(f"[START] Starting Market Maker for {len(self.token_ids)} tokens... (Dry Run: {self.dry_run})")
-        
-        # Fetch Initial State (Snapshot)
+        logger.info(
+            "[START] Starting Market Maker for %s tokens... (Dry Run: %s)",
+            len(self.token_ids),
+            self.dry_run,
+        )
+
         await self.fetch_initial_book()
-        
-        # Start Feed
+
         asyncio.create_task(self.feed.start())
-        
-        # Subscribe
-        await asyncio.sleep(2) 
+
+        await asyncio.sleep(2)
         self.feed.subscribe(self.token_ids)
-        
-        # Keep running
+
         while True:
             await asyncio.sleep(1)
 
     async def fetch_initial_book(self):
-        """Fetch REST snapshot to initialize books"""
-        print("[INIT] Fetching initial orderbooks...")
+        """Fetch REST snapshot to initialize books."""
+        logger.info("[INIT] Fetching initial orderbooks...")
         async with aiohttp.ClientSession() as session:
             for tid in self.token_ids:
                 try:
-                    url = f"https://clob.polymarket.com/book?token_id={tid}"
-                    async with session.get(url) as resp:
-                        if resp.status == 200:
-                            data = await resp.json()
-                            
-                            # Update Book
-                            book = self.books[tid]
-                            # Clear old?
-                            bids = data.get('bids', [])
-                            asks = data.get('asks', [])
-                            
-                            for b in bids: book.update('BUY', float(b['price']), float(b['size']))
-                            for a in asks: book.update('SELL', float(a['price']), float(a['size']))
-                            
-                            # Initial Quote
-                            mid = book.get_mid_price()
-                            if mid:
-                                await self.update_quotes(tid, mid, book)
-                                
-                except Exception as e:
-                    print(f"[ERR] Initial fetch failed for {tid}: {e}")
-            
+                    await self._fetch_and_load_book(session, tid)
+                except Exception:
+                    logger.exception("[ERR] Initial fetch failed for %s", tid)
+
+    async def _fetch_and_load_book(self, session: aiohttp.ClientSession, token_id: str):
+        url = f"https://clob.polymarket.com/book?token_id={token_id}"
+        async with session.get(url) as resp:
+            if resp.status != 200:
+                logger.warning("[WARN] Snapshot request failed for %s (%s)", token_id, resp.status)
+                return
+
+            data = await resp.json()
+            await self._apply_snapshot(token_id, data)
+
     async def on_market_update(self, msg: Dict):
-        """Process WS message"""
-        # DEBUG: Print raw message type
-        print(f"[DEBUG] Msg received: {msg.get('event_type')} id={msg.get('asset_id')}")
-        
+        """Process WebSocket messages from the feed."""
         event_type = msg.get("event_type")
-        
+        token_id = msg.get("asset_id")
+
+        logger.debug("[DEBUG] Msg received: %s id=%s", event_type, token_id)
+
         if event_type == "price_change":
             self.process_price_change(msg)
         elif event_type == "book":
-             print("[DEBUG] Book Snapshot received")
-             # TODO: process snapshot
+            await self.process_book_snapshot(msg)
         else:
-             print(f"[DEBUG] Other event: {event_type}")
-            
+            logger.debug("[DEBUG] Other event: %s", event_type)
+
+    async def process_book_snapshot(self, msg: Dict):
+        token_id = msg.get("asset_id")
+        if not token_id or token_id not in self.books:
+            return
+
+        await self._apply_snapshot(token_id, msg)
+
+    async def _apply_snapshot(self, token_id: str, snapshot: Dict):
+        book = self.books[token_id]
+        book.clear()
+
+        bids = snapshot.get("bids", [])
+        asks = snapshot.get("asks", [])
+
+        for bid in bids:
+            book.update("BUY", float(bid["price"]), float(bid["size"]))
+        for ask in asks:
+            book.update("SELL", float(ask["price"]), float(ask["size"]))
+
+        mid = book.get_mid_price()
+        if mid:
+            await self.update_quotes(token_id, mid, book)
+
     def process_price_change(self, msg: Dict):
         token_id = msg.get("asset_id")
-        # DEBUG
-        # print(f"[DEBUG] Price update for {token_id} (Tracking {len(self.books)})")
-        
-        if token_id not in self.books: return
-        
+        if not token_id or token_id not in self.books:
+            return
+
         price = float(msg.get("price", 0))
         size = float(msg.get("size", 0))
-        side = msg.get("side", "").upper() # BUY or SELL
-        
-        # Update Book
+        side = msg.get("side", "").upper()  # BUY or SELL
+
+        if side not in {"BUY", "SELL"}:
+            logger.debug("[DEBUG] Ignoring update with side=%s", side)
+            return
+
         book = self.books[token_id]
         book.update(side, price, size)
-        
-        # Recalculate Quote
+
         mid = book.get_mid_price()
         if mid:
             asyncio.create_task(self.update_quotes(token_id, mid, book))
-            
-    async def update_quotes(self, token_id, mid, book):
+
+    async def update_quotes(self, token_id: str, mid: float, book: OrderBook):
         # Desired Bid/Ask
-        # TODO: Skew based on Inventory here
         my_bid = round(mid - (self.spread / 2), 3)
         my_ask = round(mid + (self.spread / 2), 3)
-        
-        # Safety checks
-        if my_bid <= 0 or my_ask >= 1.0 or my_bid >= my_ask: return
+
+        if my_bid <= 0 or my_ask >= 1.0 or my_bid >= my_ask:
+            return
 
         bb, _ = book.get_best_bid()
         ba, _ = book.get_best_ask()
-        
-        log_msg = f"[QUOTE] {token_id[:10]}... | Mid: {mid:.3f} | Market: {bb:.3f}-{ba:.3f} | Mine: {my_bid:.3f}-{my_ask:.3f}"
-        
+        if bb is None or ba is None:
+            return
+
+        # Avoid crossing the book and leave a small buffer inside the spread
+        my_bid = min(my_bid, ba - 0.001)
+        my_ask = max(my_ask, bb + 0.001)
+
+        log_msg = (
+            f"[QUOTE] {token_id[:10]}... | Mid: {mid:.3f} | "
+            f"Market: {bb:.3f}-{ba:.3f} | Mine: {my_bid:.3f}-{my_ask:.3f}"
+        )
+
         if self.dry_run:
-            print(log_msg + " (DRY)")
+            logger.info("%s (DRY)", log_msg)
         else:
-            print(log_msg + " (LIVE)")
+            logger.info("%s (LIVE)", log_msg)
             await self.execute_quotes(token_id, my_bid, my_ask)
 
-    async def execute_quotes(self, token_id, bid_price, ask_price):
+    async def execute_quotes(self, token_id: str, bid_price: float, ask_price: float):
         """
         Cancel previous orders and place new ones.
         This is a naive implementation (Cancel-All-Replace).
         Pro version would diff/amend.
         """
-        if not self.executor: return
-        
-        # Cancel previous
+        if not self.executor:
+            logger.warning("No executor configured; skipping live quote placement")
+            return
+
         orders = self.active_orders.get(token_id, {})
-        if orders.get('BID'):
-             self.executor.cancel_order(orders['BID'])
-        if orders.get('ASK'):
-             self.executor.cancel_order(orders['ASK'])
-             
-        # Place new
-        # We run these concurrently to be faster
-        # In python synchronous executor, we might block event loop. 
-        # Ideally place_order should be async. The current PolymarketOrderExecutor is sync blocking IO logic inside async loop.
-        # We should use run_in_executor to avoid blocking the WS loop.
-        
         loop = asyncio.get_running_loop()
-        
-        # Place Bid
-        bid_oid = await loop.run_in_executor(None, self.executor.place_order, token_id, 'BUY', bid_price, self.size)
-        
-        # Place Ask
-        ask_oid = await loop.run_in_executor(None, self.executor.place_order, token_id, 'SELL', ask_price, self.size)
-        
-        self.active_orders[token_id] = {'BID': bid_oid, 'ASK': ask_oid}
+
+        cancel_tasks = []
+        if orders.get("BID"):
+            cancel_tasks.append(loop.run_in_executor(None, self.executor.cancel_order, orders["BID"]))
+        if orders.get("ASK"):
+            cancel_tasks.append(loop.run_in_executor(None, self.executor.cancel_order, orders["ASK"]))
+
+        if cancel_tasks:
+            await asyncio.gather(*cancel_tasks, return_exceptions=True)
+
+        bid_oid = await loop.run_in_executor(
+            None, self.executor.place_order, token_id, "BUY", bid_price, self.size
+        )
+        ask_oid = await loop.run_in_executor(
+            None, self.executor.place_order, token_id, "SELL", ask_price, self.size
+        )
+
+        self.active_orders[token_id] = {"BID": bid_oid, "ASK": ask_oid}
+
 
 if __name__ == "__main__":
-    # Test with a dummy ID (or fetch one if running standalone)
+    # Placeholder for potential manual testing entrypoint
     pass
-
