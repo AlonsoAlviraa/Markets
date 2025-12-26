@@ -10,7 +10,7 @@ def zip_project():
     
     # Files/Dirs to exclude
     exclude_dirs = {'.git', '__pycache__', 'logs', 'venv', '.idea', '.vscode'}
-    exclude_files = {output_filename, 'deploy.ps1', 'deploy.sh', '.ds_store', 'signals.db'}
+    exclude_files = {output_filename, 'deploy.ps1', 'deploy.sh', '.ds_store', 'signals.db', '.env'}
     
     with zipfile.ZipFile(output_filename, 'w', zipfile.ZIP_DEFLATED) as zipf:
         for root, dirs, files in os.walk(source_dir):
