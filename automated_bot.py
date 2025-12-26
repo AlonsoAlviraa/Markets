@@ -31,29 +31,43 @@ class AutomatedArbitrageBot:
         # Execution flags
         self.enable_atomic_execution = os.getenv("ENABLE_ATOMIC_EXECUTION", "false").lower() == "true"
         self.enable_market_making = os.getenv("ENABLE_MARKET_MAKING", "false").lower() == "true"
+        self.mm_dry_run = os.getenv("MARKET_MAKING_DRY_RUN", "true").lower() == "true"
         
         # Initialize components
         self.detector = ArbitrageDetector(min_profit_percent=self.min_profit)
         self.atomic_scanner = AtomicArbitrageScanner()
         self.atomic_scanner.MIN_PROFIT_THRESHOLD = self.min_profit / 100
         
-        # Initialize Execution (if enabled)
+        # Initialize Execution (Atomic + CLOB)
         self.executor = None
         self.clob_executor = None
+        
+        # Try to init CLOB Executor if needed
+        if self.enable_atomic_execution or self.enable_market_making:
+            try:
+                # Check for CLOB keys existence first to avoid crash
+                if os.getenv("PRIVATE_KEY") or os.getenv("POLY_KEY"):
+                    self.clob_executor = PolymarketOrderExecutor()
+                    print("✅ CLOB Executor initialized")
+                else:
+                    print("⚠️ CLOB Executor skipped (No Private Key found)")
+            except Exception as e:
+                 print(f"❌ CLOB Executor init failed: {e}")
+
         if self.enable_atomic_execution:
             try:
                 self.wallet_manager = WalletManager()
                 self.executor = AtomicExecutor(self.wallet_manager)
-                self.clob_executor = PolymarketOrderExecutor()
                 print("✅ Atomic Execution ENABLED (CTF + CLOB)")
             except Exception as e:
-                print(f"❌ Failed to init execution: {e}")
+                print(f"❌ Atomic Execution init failed: {e}")
                 self.enable_atomic_execution = False
         
         # Initialize Market Maker (if enabled)
         self.market_maker = None
         if self.enable_market_making:
-            print("🔷 Market Making ENABLED (Startup deferred)")
+            status = "DRY RUN" if self.mm_dry_run else "LIVE TRADING"
+            print(f"🔷 Market Making ENABLED ({status}) (Startup deferred)")
         
         # Initialize Telegram
         telegram_token = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -68,7 +82,12 @@ class AutomatedArbitrageBot:
         
         modes = []
         if self.enable_atomic_execution: modes.append("EXECUTION")
-        if self.enable_market_making: modes.append("MARKET_MAKING")
+        if self.enable_market_making: 
+             modes.append("MARKET_MAKING")
+             if not self.clob_executor and not self.mm_dry_run:
+                  print("⚠️ MM is LIVE but no Executor! Switching to DRY RUN forced.")
+                  self.mm_dry_run = True
+                  
         if not modes: modes.append("SIGNAL_ONLY")
         
         self.mode = "+".join(modes)
@@ -79,6 +98,9 @@ class AutomatedArbitrageBot:
             print("   Telegram: Active")
         else:
             print("   Telegram: Disabled (Check .env)")
+
+    # ... (Keep existing methods) ...
+    # notify_opportunity, execute_atomic_opportunity, get_active_token_id, run_scan_cycle
 
     async def notify_opportunity(self, opportunity: Dict) -> bool:
         """
@@ -217,7 +239,11 @@ class AutomatedArbitrageBot:
             token_id = await self.get_active_token_id()
             if token_id:
                 print(f"🔷 Starting MM for token {token_id}...")
-                self.market_maker = SimpleMarketMaker(token_ids=[str(token_id)])
+                self.market_maker = SimpleMarketMaker(
+                    token_ids=[str(token_id)],
+                    executor=self.clob_executor,
+                    dry_run=self.mm_dry_run
+                )
                 mm_task = asyncio.create_task(self.market_maker.start())
             else:
                 print("❌ Could not find token for Market Making.")
@@ -244,6 +270,7 @@ class AutomatedArbitrageBot:
                 await self.telegram.send_message(
                     f"Bot stopped\nUptime: {uptime:.1f}h\nSignals Found: {self.total_signals}"
                 )
+
 
 if __name__ == "__main__":
     bot = AutomatedArbitrageBot()
