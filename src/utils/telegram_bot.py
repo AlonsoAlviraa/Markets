@@ -75,3 +75,25 @@ class TelegramBot:
             f"⚡ *EXECUTE NOW!*"
         )
         await self.send_message(message)
+    async def send_atomic_alert(self, opp, position_size: float = 10.0):
+        """Send atomic arbitrage (mint/merge) alert"""
+        
+        # Calculate sums and profits
+        profit_usd = (opp.estimated_profit_pct / 100) * position_size
+        direction_emoji = "📉" if opp.direction == "BUY_MERGE" else "📈"
+        action = "BUY YES + NO" if opp.direction == "BUY_MERGE" else "SPLIT & SELL YES + NO"
+        
+        message = (
+            f"⚛️ *ATOMIC ARBITRAGE SIGNAL* {direction_emoji}\n\n"
+            f"🏆 *Market:* {opp.market_title}\n"
+            f"💰 *Profit:* {opp.estimated_profit_pct:.2f}% (Est. ${profit_usd:.2f} per ${position_size})\n\n"
+            
+            f"🛑 *Target Prices:*\n"
+            f"• YES: ${opp.yes_price:.4f}\n"
+            f"• NO:  ${opp.no_price:.4f}\n"
+            f"• sum: ${opp.sum_price:.4f} (Dev: {opp.deviation:+.4f})\n\n"
+            
+            f"⚡ *ACTION: {action}*\n"
+            f"🔗 [OPEN MARKET](https://polymarket.com/market/{opp.market_id})"
+        )
+        await self.send_message(message)

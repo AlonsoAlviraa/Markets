@@ -4,6 +4,7 @@ import sys
 from typing import Dict
 from datetime import datetime
 from src.core.arbitrage_detector import ArbitrageDetector
+from src.strategies.atomic_arbitrage import AtomicArbitrageScanner
 from src.utils.telegram_bot import TelegramBot
 from dotenv import load_dotenv
 
@@ -23,6 +24,9 @@ class AutomatedArbitrageBot:
         
         # Initialize components
         self.detector = ArbitrageDetector(min_profit_percent=self.min_profit)
+        self.atomic_scanner = AtomicArbitrageScanner()
+        # Override atomic settings with env vars if needed
+        self.atomic_scanner.MIN_PROFIT_THRESHOLD = self.min_profit / 100
         
         # Initialize Telegram
         telegram_token = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -67,14 +71,26 @@ class AutomatedArbitrageBot:
     async def run_scan_cycle(self):
         """Run one scan cycle"""
         try:
-            # Scan for opportunities
+            # 1. Scan for Atomic Arbitrage (High Priority)
+            print("\n🔍 Scanning for Atomic Arbitrage...")
+            atomic_opps = await self.atomic_scanner.scan_for_opportunities()
+            
+            if atomic_opps:
+                print(f"✨ Found {len(atomic_opps)} atomic opportunities!")
+                for opp in atomic_opps:
+                    self.total_signals += 1
+                    if self.telegram:
+                        await self.telegram.send_atomic_alert(opp, self.max_position_size)
+            
+            # 2. Scan for Inter-Exchange Arbitrage
+            print("\n🔍 Scanning for Inter-Exchange Arbitrage...")
             opportunities = await self.detector.scan_for_opportunities()
             
             # Notify for all opportunities
             for opp in opportunities:
                 await self.notify_opportunity(opp)
             
-            if not opportunities:
+            if not opportunities and not atomic_opps:
                 print("   No opportunities found this cycle.")
         
         except Exception as e:
