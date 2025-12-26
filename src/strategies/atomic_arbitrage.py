@@ -224,6 +224,8 @@ class AtomicArbitrageScanner:
             no_token_id=t2,
             timestamp=datetime.now()
         )
+        # Monkey patch or update dataclass later, for now just attach it
+        opp.condition_id = market.get("conditionId")
         self.opportunities.append(opp)
         
         arrow = ">>>" if direction == "SPLIT_SELL" else "<<<"

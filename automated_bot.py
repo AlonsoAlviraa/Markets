@@ -5,6 +5,8 @@ from typing import Dict
 from datetime import datetime
 from src.core.arbitrage_detector import ArbitrageDetector
 from src.strategies.atomic_arbitrage import AtomicArbitrageScanner
+from src.core.atomic_executor import AtomicExecutor
+from src.wallet.wallet_manager import WalletManager
 from src.utils.telegram_bot import TelegramBot
 from dotenv import load_dotenv
 
@@ -12,8 +14,7 @@ load_dotenv()
 
 class AutomatedArbitrageBot:
     """
-    Signal-Only Arbitrage Bot.
-    Scans for opportunities and sends Telegram alerts.
+    Arbitrage Bot with Signal and Execution capabilities.
     """
     
     def __init__(self):
@@ -22,11 +23,24 @@ class AutomatedArbitrageBot:
         self.max_position_size = float(os.getenv("MAX_POSITION_SIZE", "10.0"))
         self.scan_interval = int(os.getenv("SCAN_INTERVAL", "60"))
         
+        # Execution flags
+        self.enable_atomic_execution = os.getenv("ENABLE_ATOMIC_EXECUTION", "false").lower() == "true"
+        
         # Initialize components
         self.detector = ArbitrageDetector(min_profit_percent=self.min_profit)
         self.atomic_scanner = AtomicArbitrageScanner()
-        # Override atomic settings with env vars if needed
         self.atomic_scanner.MIN_PROFIT_THRESHOLD = self.min_profit / 100
+        
+        # Initialize Execution (if enabled)
+        self.executor = None
+        if self.enable_atomic_execution:
+            try:
+                self.wallet_manager = WalletManager()
+                self.executor = AtomicExecutor(self.wallet_manager)
+                print("✅ Atomic Execution ENABLED")
+            except Exception as e:
+                print(f"❌ Failed to init execution: {e}")
+                self.enable_atomic_execution = False
         
         # Initialize Telegram
         telegram_token = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -39,7 +53,7 @@ class AutomatedArbitrageBot:
         self.total_signals = 0
         self.start_time = datetime.now()
         
-        self.mode = "SIGNAL_ONLY"
+        self.mode = "EXECUTION" if self.enable_atomic_execution else "SIGNAL_ONLY"
         print(f"🤖 Automated Arbitrage Bot initialized ({self.mode})")
         print(f"   Min profit: {self.min_profit}%")
         print(f"   Scan interval: {self.scan_interval}s")
@@ -67,7 +81,32 @@ class AutomatedArbitrageBot:
         except Exception as e:
             print(f"   ❌ Signal failed: {e}")
             return False
-    
+            
+    async def execute_atomic_opportunity(self, opp):
+        """Execute atomic mint/merge transaction"""
+        if not self.executor: return
+        
+        tx_hash = None
+        if opp.direction == "BUY_MERGE":
+            # Need to buy YES+NO first?? Currently scanner assumes we buy ON CLOB.
+            # Strategy A in PDF says: "Comprar YES y NO... luego fusionar"
+            # Wait, the executor does Mint (Split USDC -> YES+NO) and Merge (YES+NO -> USDC).
+            # If market sum < 1.0 (BUY_MERGE), we buy cheap tokens and merge them for $1.
+            #   -> Requires CLOB BUY orders first.
+            # If market sum > 1.0 (SPLIT_SELL), we split $1 USDC -> YES+NO and sell expensive tokens.
+            #   -> Requires CTF Split first, then CLOB SELL orders.
+            
+            # For now, implementing SPLIT_SELL flow as it starts with USDC
+            if opp.direction == "SPLIT_SELL":
+                # 1. Split USDC
+                tx_hash = await self.executor.execute_split(opp.condition_id, self.max_position_size)
+                # 2. Sell on CLOB (TODO: Implement CLOB execution)
+                if tx_hash and self.telegram:
+                     await self.telegram.send_message(f"✅ Executed SPLIT: {tx_hash}")
+            else:
+                # BUY_MERGE requires buying first, too complex for atomic executor alone right now
+                pass
+        
     async def run_scan_cycle(self):
         """Run one scan cycle"""
         try:
@@ -79,8 +118,14 @@ class AutomatedArbitrageBot:
                 print(f"✨ Found {len(atomic_opps)} atomic opportunities!")
                 for opp in atomic_opps:
                     self.total_signals += 1
+                    
+                    # Notify
                     if self.telegram:
                         await self.telegram.send_atomic_alert(opp, self.max_position_size)
+                        
+                    # Execute if enabled
+                    if self.enable_atomic_execution:
+                        await self.execute_atomic_opportunity(opp)
             
             # 2. Scan for Inter-Exchange Arbitrage
             print("\n🔍 Scanning for Inter-Exchange Arbitrage...")
@@ -103,11 +148,16 @@ class AutomatedArbitrageBot:
         print(f"\n🚀 Bot starting... Scanning every {self.scan_interval}s")
         
         if self.telegram:
-            await self.telegram.send_message(
-                f"🤖 Arbitrage Signal Bot Started\n"
-                f"Min profit: {self.min_profit}%\n"
-                f"Bet Sizing: ${self.max_position_size}"
-            )
+            try:
+                await self.telegram.send_message(
+                    f"🤖 *Arbitrage Bot Started ({self.mode})*\n"
+                    f"🎯 Min profit: {self.min_profit}%\n"
+                    f"💰 Bet Size: ${self.max_position_size}\n"
+                    f"⚡ Execution: {'ENABLED' if self.enable_atomic_execution else 'DISABLED'}\n"
+                )
+                print("   ✅ Telegram startup message sent")
+            except Exception as e:
+                print(f"   ❌ Failed to send Telegram startup message: {e}")
         
         try:
             while True:
