@@ -24,4 +24,5 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
 if not ODDS_API_KEYS or len(ODDS_API_KEYS) == 0:
-    raise ValueError("ODDS_API_KEY not found in .env file")
+    # raise ValueError("ODDS_API_KEY not found in .env file")
+    print("⚠️ WARN: ODDS_API_KEY not found. Sports Arbitrage Collectors will be disabled.")
