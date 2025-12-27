@@ -64,7 +64,18 @@ class SimpleMarketMaker:
         self.feed.subscribe(self.token_ids)
 
         while True:
-            await asyncio.sleep(1)
+            await asyncio.sleep(10)
+            # Periodic Opportunity Scan
+            opps = self.find_opportunities()
+            if opps:
+                top = opps[:3]
+                for op in top:
+                    logger.info(
+                        "[OPP] Token %s... | Score: %.2f | Mechanics: %s",
+                        op['token_id'][:8],
+                        op['score'],
+                        ", ".join(op['mechanics'])
+                    )
 
     async def fetch_initial_book(self):
         """Fetch REST snapshot to initialize books."""
