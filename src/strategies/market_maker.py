@@ -1,8 +1,7 @@
 import asyncio
 import logging
-import statistics
 from collections import deque
-from typing import Dict, List, Optional, Tuple
+from typing import Deque, Dict, List, Optional, Tuple
 
 import aiohttp
 
@@ -15,12 +14,11 @@ logger = logging.getLogger(__name__)
 
 class SimpleMarketMaker:
     """
-    Intelligent Market Maker Strategy.
+    Simple Market Making Strategy.
     - Subscribes to Token IDs.
     - Maintains local BBO/Book.
-    - Calculates Quotes around Mid-Price (with Skew & Safety).
+    - Calculates Quotes around Mid-Price.
     - Executes LIMIT orders (if dry_run=False).
-    - Safety: Volatility Pause, Trend Awareness.
     """
 
     def __init__(
@@ -34,8 +32,15 @@ class SimpleMarketMaker:
         inventory_skew: float = 0.05,
         wide_spread_threshold: float = 0.04,
         opportunity_score_threshold: float = 0.6,
-        volatility_window: int = 20,
-        volatility_threshold: float = 0.05,  # 5% std dev pause
+        volatility_window: int = 12,
+        volatility_threshold: float = 0.01,
+        momentum_window: int = 5,
+        trend_threshold: float = 0.004,
+        vacuum_depth_threshold: float = 0.2,
+        risk_pause_vol_multiplier: float = 2.5,
+        risk_pause_trend_multiplier: float = 2.0,
+        social_sentiment_bias: float = 0.5,
+        whale_pressure_widen: float = 0.2,
     ):
         self.token_ids = token_ids
         self.executor = executor
@@ -46,14 +51,15 @@ class SimpleMarketMaker:
         self.inventory_skew = inventory_skew
         self.wide_spread_threshold = wide_spread_threshold
         self.opportunity_score_threshold = opportunity_score_threshold
-        
-        # Volatility & History
-        self.volatility_window = volatility_window
+        self.volatility_window = max(3, volatility_window)
         self.volatility_threshold = volatility_threshold
-        self.price_history: Dict[str, deque] = {
-            tid: deque(maxlen=volatility_window) for tid in token_ids
-        }
-        
+        self.momentum_window = max(2, momentum_window)
+        self.trend_threshold = trend_threshold
+        self.vacuum_depth_threshold = vacuum_depth_threshold
+        self.risk_pause_vol_multiplier = risk_pause_vol_multiplier
+        self.risk_pause_trend_multiplier = risk_pause_trend_multiplier
+        self.social_sentiment_bias = social_sentiment_bias
+        self.whale_pressure_widen = whale_pressure_widen
         self.books: Dict[str, OrderBook] = {tid: OrderBook(tid) for tid in token_ids}
         self.feed = MarketDataFeed()
         self.feed.add_callback(self.on_market_update)
@@ -61,11 +67,13 @@ class SimpleMarketMaker:
         # Track our open orders: TokenID -> {'BID': order_id, 'ASK': order_id}
         self.active_orders: Dict[str, Dict[str, str]] = {tid: {} for tid in token_ids}
         self.last_mid: Dict[str, float] = {}
-
-from src.utils.notifier import send_telegram_alert
-
-class SimpleMarketMaker:
-    # ... (init remains same)
+        self.mid_history: Dict[str, Deque[float]] = {
+            tid: deque(maxlen=self.volatility_window) for tid in token_ids
+        }
+        self.social_signals: Dict[str, Dict[str, float]] = {
+            tid: {"sentiment": 0.0, "buzz": 0.0, "whale_pressure": 0.0}
+            for tid in token_ids
+        }
 
     async def start(self):
         logger.info(
@@ -82,29 +90,7 @@ class SimpleMarketMaker:
         self.feed.subscribe(self.token_ids)
 
         while True:
-            await asyncio.sleep(10)
-            # Periodic Opportunity Scan
-            opps = self.find_opportunities()
-            if opps:
-                top = opps[:3]
-                for op in top:
-                    log_msg = f"[OPP] Token {op['token_id'][:8]}... | Score: {op['score']:.2f} | Mechanics: {', '.join(op['mechanics'])}"
-                    logger.info(log_msg)
-                    
-                    # ALERT TO TELEGRAM (Engagement Fix)
-                    if op['score'] >= 0.7:
-                        tg_msg = (
-                            f"🎯 **MM Opportunity Detected**\n"
-                            f"Token: `{op['token_id'][:15]}...`\n"
-                            f"Score: **{op['score']:.2f}**\n"
-                            f"Mechanics: _{', '.join(op['mechanics'])}_\n"
-                            f"Vol: {op['metrics'].get('volatility', 0):.4f}"
-                        )
-                        try:
-                            # Run in executor to avoid blocking loop
-                            await asyncio.get_running_loop().run_in_executor(None, send_telegram_alert, tg_msg)
-                        except Exception:
-                            logger.error("Failed to send TG alert", exc_info=True)
+            await asyncio.sleep(1)
 
     async def fetch_initial_book(self):
         """Fetch REST snapshot to initialize books."""
@@ -140,6 +126,29 @@ class SimpleMarketMaker:
         else:
             logger.debug("[DEBUG] Other event: %s", event_type)
 
+    def ingest_social_signal(
+        self,
+        token_id: str,
+        sentiment: float = 0.0,
+        buzz: float = 0.0,
+        whale_pressure: float = 0.0,
+    ) -> None:
+        """Record social sentiment/buzz signals and whale pressure for a token.
+
+        Values are clamped to [0, 1] for buzz/whale_pressure and [-1, 1] for sentiment.
+        """
+
+        if token_id not in self.social_signals:
+            logger.debug("[SOCIAL] Ignoring signal for unknown token %s", token_id)
+            return
+
+        sanitized = {
+            "sentiment": max(-1.0, min(1.0, sentiment)),
+            "buzz": max(0.0, min(1.0, buzz)),
+            "whale_pressure": max(0.0, min(1.0, whale_pressure)),
+        }
+        self.social_signals[token_id].update(sanitized)
+
     async def process_book_snapshot(self, msg: Dict):
         token_id = msg.get("asset_id")
         if not token_id or token_id not in self.books:
@@ -161,7 +170,6 @@ class SimpleMarketMaker:
 
         mid = book.get_mid_price()
         if mid:
-            self._update_history(token_id, mid)
             await self.update_quotes(token_id, mid, book)
 
     def process_price_change(self, msg: Dict):
@@ -182,17 +190,12 @@ class SimpleMarketMaker:
 
         mid = book.get_mid_price()
         if mid:
-            self._update_history(token_id, mid)
             asyncio.create_task(self.update_quotes(token_id, mid, book))
-
-    def _update_history(self, token_id: str, mid: float):
-        if token_id in self.price_history:
-            self.price_history[token_id].append(mid)
 
     def compute_book_metrics(self, token_id: str, book: Optional[OrderBook] = None) -> Dict:
         book = book or self.books[token_id]
-        bb, _ = book.get_best_bid()
-        ba, _ = book.get_best_ask()
+        bb, bb_size = book.get_best_bid()
+        ba, ba_size = book.get_best_ask()
         mid = book.get_mid_price()
         spread = book.get_spread()
 
@@ -200,25 +203,23 @@ class SimpleMarketMaker:
         ask_depth = sum(book.asks.values())
         total_depth = bid_depth + ask_depth
         imbalance = 0.0
+        top_depth_share = 0.0
         if total_depth > 0:
             imbalance = (bid_depth - ask_depth) / total_depth
+            top_depth_share = (bb_size + ba_size) / total_depth
 
         prev_mid = self.last_mid.get(token_id, mid or 0.0)
         mid_change = (mid or prev_mid) - prev_mid
-        
-        # Volatility Calculation
-        history = self.price_history.get(token_id, [])
-        volatility = 0.0
-        trend = 0.0
-        if len(history) > 2:
-            try:
-                stdev = statistics.stdev(history)
-                mean = statistics.mean(history)
-                volatility = stdev / mean if mean > 0 else 0.0
-                trend = (history[-1] - mean) / mean if mean > 0 else 0.0
-            except Exception:
-                pass
 
+        if mid is not None:
+            self._record_mid(token_id, mid)
+            self.last_mid[token_id] = mid
+
+        volatility = self._compute_volatility(token_id)
+        trend = self._compute_trend(token_id)
+        social = self.social_signals.get(
+            token_id, {"sentiment": 0.0, "buzz": 0.0, "whale_pressure": 0.0}
+        )
         metrics = {
             "mid": mid,
             "spread": spread,
@@ -228,47 +229,97 @@ class SimpleMarketMaker:
             "wide_spread": bool(spread is not None and spread >= self.wide_spread_threshold),
             "mid_change": mid_change,
             "volatility": volatility,
-            "trend": trend,
-            "depth_weighted_mid": mid, # Placeholder
+            "micro_trend": trend,
+            "top_depth_share": top_depth_share,
+            "liquidity_vacuum": bool(top_depth_share <= self.vacuum_depth_threshold),
+            "social_sentiment": social.get("sentiment", 0.0),
+            "social_buzz": social.get("buzz", 0.0),
+            "whale_pressure": social.get("whale_pressure", 0.0),
         }
 
-        if mid is not None:
-            self.last_mid[token_id] = mid
-
         return metrics
+
+    def _record_mid(self, token_id: str, mid: float):
+        history = self.mid_history.setdefault(token_id, deque(maxlen=self.volatility_window))
+        history.append(mid)
+
+    def _compute_volatility(self, token_id: str) -> float:
+        history = self.mid_history.get(token_id, deque())
+        if len(history) < 2:
+            return 0.0
+        mean = sum(history) / len(history)
+        variance = sum((p - mean) ** 2 for p in history) / len(history)
+        return round(variance**0.5, 6)
+
+    def _compute_trend(self, token_id: str) -> float:
+        history = self.mid_history.get(token_id, deque())
+        if len(history) < 2:
+            return 0.0
+        window = list(history)[-self.momentum_window :]
+        if len(window) < 2 or window[0] == 0:
+            return 0.0
+        return round((window[-1] - window[0]) / window[0], 6)
+
+    def _should_pause_quotes(self, metrics: Dict) -> Tuple[bool, Optional[str]]:
+        volatility = metrics.get("volatility", 0.0)
+        trend = abs(metrics.get("micro_trend", 0.0))
+
+        extreme_vol = volatility >= self.volatility_threshold * self.risk_pause_vol_multiplier
+        extreme_trend = trend >= self.trend_threshold * self.risk_pause_trend_multiplier
+
+        if extreme_vol and extreme_trend:
+            return True, "volatility_and_trend"
+        if extreme_vol:
+            return True, "volatility"
+        if extreme_trend:
+            return True, "trend"
+
+        return False, None
 
     def _generate_quote_prices(
         self, token_id: str, mid: float, book: OrderBook, metrics: Optional[Dict] = None
     ) -> Optional[Tuple[float, float]]:
         metrics = metrics or self.compute_book_metrics(token_id, book)
+        should_pause, pause_reason = self._should_pause_quotes(metrics)
+        if should_pause:
+            logger.info(
+                "[PAUSE] Skipping quotes due to %s | vol=%.4f trend=%.4f",
+                pause_reason,
+                metrics.get("volatility", 0.0),
+                metrics.get("micro_trend", 0.0),
+            )
+            return None
+
         bb, _ = book.get_best_bid()
         ba, _ = book.get_best_ask()
 
         if bb is None or ba is None:
             return None
 
-        # Volatility Pause Check
-        if metrics.get("volatility", 0.0) > self.volatility_threshold:
-            logger.warning("[SAFETY] Volatility %.4f > %.4f for %s. PAUSING.", 
-                           metrics["volatility"], self.volatility_threshold, token_id[:8])
-            return None
-
         base_half = max(0.001, self.spread / 2)
         if metrics.get("wide_spread") and metrics.get("spread"):
             base_half = min(base_half, metrics["spread"] * self.inside_spread_ratio / 2)
 
+        volatility = metrics.get("volatility", 0.0)
+        if volatility > self.volatility_threshold:
+            vol_ratio = min(3.0, (volatility - self.volatility_threshold) / max(self.volatility_threshold, 1e-6))
+            base_half *= 1 + vol_ratio * 0.15
+
+        trend_bias = metrics.get("micro_trend", 0.0)
+        trend_skew = trend_bias * self.inside_spread_ratio * base_half
+
+        social_sentiment = metrics.get("social_sentiment", 0.0)
+        social_buzz = metrics.get("social_buzz", 0.0)
+        whale_pressure = metrics.get("whale_pressure", 0.0)
+
+        base_half *= 1 + social_buzz * 0.1
+        base_half *= 1 + whale_pressure * self.whale_pressure_widen
+
+        sentiment_skew = social_sentiment * self.social_sentiment_bias * base_half * 0.5
+
         skew = metrics.get("imbalance", 0.0) * self.inventory_skew * base_half
-        
-        # Trend Awareness: If trending UP (trend > 0), skew higher (Buy) or lower (Fade)?
-        # User said "Trend Aware Skewing". We assume Fade Trend (Mean Reversion) for MM.
-        # But if momentum is strong, we might want to get out of the way.
-        # Let's add minor Trend component to skew.
-        trend_skew = metrics.get("trend", 0.0) * 0.1 # Small factor
-        # Adjusted Skew
-        total_skew = skew - trend_skew # Fade trend: If Trend is + (Up), subtract (Lower quotes) to Sell?
-        
-        my_bid = round(mid - base_half - total_skew, 3)
-        my_ask = round(mid + base_half - total_skew, 3)
+        my_bid = round(mid - base_half - skew - trend_skew + sentiment_skew, 3)
+        my_ask = round(mid + base_half - skew - trend_skew + sentiment_skew, 3)
 
         if my_bid <= 0 or my_ask >= 1.0 or my_bid >= my_ask:
             return None
@@ -283,15 +334,29 @@ class SimpleMarketMaker:
         if metrics.get("spread"):
             spread_edge = min(1.0, metrics["spread"] / max(self.spread, 0.001)) * 0.5
 
-        imbalance_edge = min(1.0, abs(metrics.get("imbalance", 0.0))) * 0.3
-        momentum_edge = min(1.0, abs(metrics.get("mid_change", 0.0))) * 0.2
-        
-        # Volatility bonus (if within limits)
-        vol_edge = 0.0
-        if 0 < metrics.get("volatility", 0.0) < self.volatility_threshold:
-            vol_edge = 0.1
+        imbalance_edge = min(1.0, abs(metrics.get("imbalance", 0.0))) * 0.25
+        momentum_edge = min(1.0, abs(metrics.get("mid_change", 0.0))) * 0.08
+        volatility_edge = min(1.0, metrics.get("volatility", 0.0) / max(self.volatility_threshold, 1e-6)) * 0.07
+        vacuum_edge = 0.07 if metrics.get("liquidity_vacuum") else 0.0
+        trend_edge = min(1.0, abs(metrics.get("micro_trend", 0.0)) / max(self.trend_threshold, 1e-6)) * 0.08
+        depth_edge = min(1.0, max(0.0, 1 - metrics.get("top_depth_share", 0.0))) * 0.05
+        sentiment_edge = min(1.0, abs(metrics.get("social_sentiment", 0.0))) * 0.05
+        buzz_edge = min(1.0, metrics.get("social_buzz", 0.0)) * 0.05
+        whale_edge = min(1.0, metrics.get("whale_pressure", 0.0)) * 0.05
 
-        return round(spread_edge + imbalance_edge + momentum_edge + vol_edge, 3)
+        return round(
+            spread_edge
+            + imbalance_edge
+            + momentum_edge
+            + volatility_edge
+            + vacuum_edge
+            + trend_edge
+            + depth_edge
+            + sentiment_edge
+            + buzz_edge
+            + whale_edge,
+            3,
+        )
 
     def find_opportunities(self) -> List[Dict]:
         """Rank tokens with actionable mechanics (wide spread, imbalance, or drift)."""
@@ -313,8 +378,22 @@ class SimpleMarketMaker:
                 mechanics.append("inventory skew")
             if abs(metrics["mid_change"]) >= 0.005:
                 mechanics.append("micro-momentum follow")
-            if metrics["volatility"] > 0.01:
-                mechanics.append("volatility harvesting")
+            if metrics.get("liquidity_vacuum"):
+                mechanics.append("liquidity vacuum sniping")
+            if metrics.get("volatility", 0.0) >= self.volatility_threshold:
+                mechanics.append("volatility breakout capture")
+            if abs(metrics.get("micro_trend", 0.0)) >= self.trend_threshold:
+                mechanics.append("trend leaning")
+            if metrics.get("volatility", 0.0) >= self.volatility_threshold * self.risk_pause_vol_multiplier:
+                mechanics.append("volatility retreat")
+            if metrics.get("liquidity_vacuum") and metrics.get("spread", 0) >= self.wide_spread_threshold * 1.5:
+                mechanics.append("vacuum wide staggering")
+            if metrics.get("social_buzz", 0.0) >= 0.6:
+                mechanics.append("social buzz momentum")
+            if abs(metrics.get("social_sentiment", 0.0)) >= 0.5:
+                mechanics.append("sentiment leaning")
+            if metrics.get("whale_pressure", 0.0) >= 0.5:
+                mechanics.append("whale shadowing")
 
             ranked.append({
                 "token_id": token_id,
@@ -328,13 +407,7 @@ class SimpleMarketMaker:
     async def update_quotes(self, token_id: str, mid: float, book: OrderBook):
         metrics = self.compute_book_metrics(token_id, book)
         quote = self._generate_quote_prices(token_id, mid, book, metrics)
-        
-        # If None (e.g. Volatility Pause), Cancel Orders?
         if not quote:
-            # We should probably CANCEL existing orders if paused?
-            # For safety, yes.
-            if metrics.get("volatility", 0.0) > self.volatility_threshold:
-                 await self.cancel_all_quotes(token_id)
             return
 
         my_bid, my_ask = quote
@@ -344,7 +417,7 @@ class SimpleMarketMaker:
             return
 
         log_msg = (
-            f"[QUOTE] {token_id[:10]}... | Mid: {mid:.3f} | Vol: {metrics['volatility']:.4f} | "
+            f"[QUOTE] {token_id[:10]}... | Mid: {mid:.3f} | "
             f"Market: {bb:.3f}-{ba:.3f} | Mine: {my_bid:.3f}-{my_ask:.3f}"
         )
 
@@ -353,15 +426,6 @@ class SimpleMarketMaker:
         else:
             logger.info("%s (LIVE)", log_msg)
             await self.execute_quotes(token_id, my_bid, my_ask)
-
-    async def cancel_all_quotes(self, token_id: str):
-        if not self.executor: return
-        orders = self.active_orders.get(token_id, {})
-        if not orders: return
-        
-        logger.warning("[SAFETY] Cancelling quotes for %s (Paused/Risk)", token_id)
-        # Logic to cancel (omitted for brevity, reusing execute logic usually)
-        # ...
 
     async def execute_quotes(self, token_id: str, bid_price: float, ask_price: float):
         """

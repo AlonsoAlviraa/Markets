@@ -23,6 +23,10 @@ POLY_CHAIN_ID = int(poly_chain_id_str) if poly_chain_id_str and poly_chain_id_st
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
+# Whale tracking configuration (used by spy/copy strategies)
+WHALE_WALLETS_RAW = os.getenv("WHALE_WALLETS", "")
+WHALE_WALLETS = [w.strip() for w in WHALE_WALLETS_RAW.split(",") if w.strip()]
+
 if not ODDS_API_KEYS or len(ODDS_API_KEYS) == 0:
     # raise ValueError("ODDS_API_KEY not found in .env file")
     print("⚠️ WARN: ODDS_API_KEY not found. Sports Arbitrage Collectors will be disabled.")

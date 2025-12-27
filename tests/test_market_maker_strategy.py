@@ -103,22 +103,145 @@ def test_find_opportunities_ranks_mechanics(bids, asks, threshold, expected_toke
         assert top_mechanic in opportunities[0]["mechanics"]
 
 
+def test_compute_book_metrics_tracks_volatility_and_vacuum():
+    maker = SimpleMarketMaker(["T"], dry_run=True, spread=0.02, volatility_threshold=0.005)
+    history_prices = [0.48, 0.49, 0.5, 0.505, 0.51]
+    for price in history_prices:
+        maker._record_mid("T", price)
 
-def test_volatility_pause():
-    maker = SimpleMarketMaker(["T"], dry_run=True, volatility_window=5, volatility_threshold=0.05)
-    book = build_book({0.5: 100}, {0.52: 100})
+    bids = {0.49: 1, 0.48: 9}
+    asks = {0.51: 1, 0.52: 9}
+    book = build_book(bids, asks)
     maker.books["T"] = book
 
-    # Feed volatile prices
-    prices = [0.5, 0.6, 0.4, 0.7, 0.3] # High variance
-    for p in prices:
-        maker._update_history("T", p)
-        
     metrics = maker.compute_book_metrics("T", book)
-    
-    # Assert Volatility Detected
-    assert metrics["volatility"] > 0.05
-    
-    # Assert Quote Paused
-    quote = maker._generate_quote_prices("T", 0.5, book, metrics)
-    assert quote is None
+
+    assert metrics["volatility"] > 0
+    assert metrics["liquidity_vacuum"] is True
+    assert metrics["top_depth_share"] == pytest.approx(0.1, rel=1e-3)
+
+
+def test_find_opportunities_adds_new_mechanics():
+    maker = SimpleMarketMaker(
+        ["T"],
+        dry_run=True,
+        spread=0.02,
+        volatility_threshold=0.005,
+        trend_threshold=0.002,
+        opportunity_score_threshold=0.3,
+    )
+    for price in [0.5, 0.505, 0.51, 0.512, 0.515]:
+        maker._record_mid("T", price)
+
+    book = build_book({0.49: 2}, {0.51: 2})
+    maker.books["T"] = book
+
+    opportunities = maker.find_opportunities()
+
+    assert len(opportunities) == 1
+    mechanics = opportunities[0]["mechanics"]
+    assert "volatility breakout capture" in mechanics
+    assert "trend leaning" in mechanics
+
+
+@pytest.mark.parametrize(
+    "prices,vol_mult,trend_mult,should_pause",
+    [
+        ([0.5, 0.56, 0.48, 0.6, 0.65], 1.0, 1.0, True),  # both extreme
+        ([0.5, 0.56, 0.58, 0.59], 1.0, 10.0, True),  # volatility-only pause
+        ([0.5, 0.505, 0.51, 0.52], 10.0, 1.0, True),  # trend-only pause
+        ([0.5, 0.501, 0.502, 0.503], 10.0, 10.0, False),  # no pause
+    ],
+)
+def test_generate_quote_prices_pauses_on_extreme_conditions(prices, vol_mult, trend_mult, should_pause):
+    maker = SimpleMarketMaker(
+        ["T"],
+        dry_run=True,
+        spread=0.02,
+        volatility_threshold=0.005,
+        trend_threshold=0.005,
+        risk_pause_vol_multiplier=vol_mult,
+        risk_pause_trend_multiplier=trend_mult,
+    )
+    for price in prices:
+        maker._record_mid("T", price)
+
+    bid_price = prices[-1]
+    ask_price = bid_price + 0.02
+    book = build_book({bid_price: 10}, {ask_price: 10})
+    maker.books["T"] = book
+
+    quote = maker._generate_quote_prices("T", book.get_mid_price(), book)
+
+    if should_pause:
+        assert quote is None
+    else:
+        assert quote is not None
+
+
+def test_generate_quote_prices_widens_with_volatility():
+    maker = SimpleMarketMaker(
+        ["T"],
+        dry_run=True,
+        spread=0.02,
+        inside_spread_ratio=0.5,
+        volatility_threshold=0.001,
+        risk_pause_vol_multiplier=100.0,
+        risk_pause_trend_multiplier=100.0,
+        trend_threshold=0.05,
+    )
+    for price in [0.5, 0.56, 0.48, 0.6]:
+        maker._record_mid("T", price)
+
+    book = build_book({0.51: 20}, {0.53: 20})
+    maker.books["T"] = book
+
+    quote = maker._generate_quote_prices("T", book.get_mid_price(), book)
+
+    assert quote is not None
+    bid, ask = quote
+    assert (ask - bid) > 0.02
+
+
+def test_social_signals_adjust_quotes_and_scoring():
+    base_maker = SimpleMarketMaker(["T"], dry_run=True, spread=0.02, inside_spread_ratio=0.5)
+    social_maker = SimpleMarketMaker(
+        ["T"],
+        dry_run=True,
+        spread=0.02,
+        inside_spread_ratio=0.5,
+        social_sentiment_bias=0.6,
+        whale_pressure_widen=0.3,
+        opportunity_score_threshold=0.2,
+    )
+
+    bids = {0.49: 20}
+    asks = {0.51: 20}
+    base_book = build_book(bids, asks)
+    social_book = build_book(bids, asks)
+    base_maker.books["T"] = base_book
+    social_maker.books["T"] = social_book
+
+    social_maker.ingest_social_signal("T", sentiment=0.7, buzz=0.8, whale_pressure=0.6)
+
+    base_quote = base_maker._generate_quote_prices("T", base_book.get_mid_price(), base_book)
+    social_quote = social_maker._generate_quote_prices(
+        "T", social_book.get_mid_price(), social_book
+    )
+
+    assert base_quote is not None and social_quote is not None
+    base_bid, base_ask = base_quote
+    social_bid, social_ask = social_quote
+
+    # Positive sentiment should keep us leaning upward, while buzz/whales widen spreads
+    assert social_bid >= base_bid
+    assert social_ask > base_ask
+    assert (social_ask - social_bid) > (base_ask - base_bid)
+
+    opportunities = social_maker.find_opportunities()
+    assert opportunities
+    mechanics = opportunities[0]["mechanics"]
+    assert "social buzz momentum" in mechanics
+    assert "whale shadowing" in mechanics
+
+
