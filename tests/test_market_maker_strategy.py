@@ -330,3 +330,72 @@ def test_whale_shadowing_feeds_ml_mechanics():
     assert "ml edge confirmation" in mechanics
 
 
+def test_regime_detection_widens_and_tags_mechanics():
+    quiet_maker = SimpleMarketMaker(["T"], dry_run=True, spread=0.02, regime_spread_widen=0.2)
+    regime_maker = SimpleMarketMaker(
+        ["T"],
+        dry_run=True,
+        spread=0.02,
+        regime_spread_widen=0.3,
+        opportunity_score_threshold=0.2,
+        risk_pause_vol_multiplier=10.0,
+        risk_pause_trend_multiplier=10.0,
+    )
+
+    bids = {0.49: 30}
+    asks = {0.51: 30}
+    quiet_book = build_book(bids, asks)
+    regime_book = build_book(bids, asks)
+    quiet_maker.books["T"] = quiet_book
+    regime_maker.books["T"] = regime_book
+
+    for price in [0.49, 0.5, 0.52, 0.55]:
+        regime_maker._record_mid("T", price)
+    regime_maker.ingest_social_signal("T", sentiment=0.6, buzz=0.8, whale_pressure=0.7)
+    regime_maker.record_whale_action("T", "BUY", size=80, confidence=0.9)
+
+    quiet_quote = quiet_maker._generate_quote_prices("T", quiet_book.get_mid_price(), quiet_book)
+    regime_quote = regime_maker._generate_quote_prices("T", regime_book.get_mid_price(), regime_book)
+
+    assert quiet_quote and regime_quote
+    quiet_spread = quiet_quote[1] - quiet_quote[0]
+    regime_spread = regime_quote[1] - regime_quote[0]
+    assert regime_spread > quiet_spread
+
+    opportunities = regime_maker.find_opportunities()
+    assert opportunities
+    mechanics = opportunities[0]["mechanics"]
+    assert "whale burst chase" in mechanics
+    assert any(tag in mechanics for tag in ["buzz echo capture", "social buzz momentum"])
+
+
+def test_ml_score_gated_until_confident():
+    model = SignalEnsembler(min_fit_samples=4)
+    maker = SimpleMarketMaker(
+        ["T"],
+        dry_run=True,
+        spread=0.02,
+        inside_spread_ratio=0.5,
+        ml_edge_weight=0.6,
+        ml_confidence_floor=0.1,
+        signal_model=model,
+        opportunity_score_threshold=0.1,
+    )
+
+    book = build_book({0.48: 20}, {0.52: 20})
+    maker.books["T"] = book
+    baseline_metrics = maker.compute_book_metrics("T", book)
+
+    low_conf_score = maker._score_opportunity(baseline_metrics)
+
+    sample = {
+        "features": maker._build_ml_features(baseline_metrics),
+        "label": 1.0,
+    }
+    maker.train_signal_model([sample] * 6)
+
+    trained_score = maker._score_opportunity(baseline_metrics)
+
+    assert trained_score > low_conf_score
+
+

@@ -48,13 +48,22 @@ class SignalEnsembler:
         return max(-1.0, min(1.0, value))
 
     def predict(self, features: Dict[str, float]) -> float:
+        prob, _ = self.predict_with_confidence(features)
+        return prob
+
+    def predict_with_confidence(self, features: Dict[str, float]) -> Tuple[float, float]:
+        """Return probability and a confidence proxy based on fit progress."""
+
         score = self.bias
         for name, weight in self.feature_weights.items():
             contrib = self._normalize(features.get(name, 0.0))
             score += weight * contrib
 
         prob = 1 / (1 + math.exp(-score))
-        return max(0.0, min(1.0, prob))
+        prob = max(0.0, min(1.0, prob))
+
+        confidence = min(1.0, self.trained_samples / max(self.min_fit_samples * 2, 1))
+        return prob, confidence
 
     def fit(self, labeled_samples: List[Dict[str, Dict[str, float]]]) -> None:
         """Update weights using simple online gradient steps.
@@ -112,6 +121,8 @@ class SimpleMarketMaker:
         social_sentiment_bias: float = 0.5,
         whale_pressure_widen: float = 0.2,
         ml_edge_weight: float = 0.35,
+        ml_confidence_floor: float = 0.2,
+        regime_spread_widen: float = 0.15,
         signal_model: Optional[SignalEnsembler] = None,
     ):
         self.token_ids = token_ids
@@ -133,6 +144,8 @@ class SimpleMarketMaker:
         self.social_sentiment_bias = social_sentiment_bias
         self.whale_pressure_widen = whale_pressure_widen
         self.ml_edge_weight = ml_edge_weight
+        self.ml_confidence_floor = ml_confidence_floor
+        self.regime_spread_widen = regime_spread_widen
         self.signal_model = signal_model or SignalEnsembler()
         self.books: Dict[str, OrderBook] = {tid: OrderBook(tid) for tid in token_ids}
         self.feed = MarketDataFeed()
@@ -376,6 +389,36 @@ class SimpleMarketMaker:
         avg_flow = sum(flow) / len(flow)
         return round(max(-1.0, min(1.0, avg_flow)), 4)
 
+    def _detect_regime(self, metrics: Dict) -> Dict[str, float]:
+        """Infer a coarse market regime to adapt width and leaning."""
+
+        volatility = metrics.get("volatility", 0.0)
+        trend = metrics.get("micro_trend", 0.0)
+        whale_shadow = metrics.get("whale_shadow_bias", 0.0)
+        whale_pressure = metrics.get("whale_pressure", 0.0)
+        social_buzz = metrics.get("social_buzz", 0.0)
+        social_sentiment = metrics.get("social_sentiment", 0.0)
+
+        widen = 0.0
+        lean = 0.0
+        tag = "normal"
+
+        if volatility >= self.volatility_threshold * 1.5 or abs(trend) >= self.trend_threshold * 1.5:
+            widen = max(widen, self.regime_spread_widen)
+            tag = "volatile" if abs(trend) < self.trend_threshold * 1.5 else "drifting"
+
+        if social_buzz >= 0.7:
+            widen = max(widen, self.regime_spread_widen * 0.6)
+            lean += social_sentiment * 0.3
+            tag = "social-buzz"
+
+        if abs(whale_shadow) >= 0.5 or whale_pressure >= 0.6:
+            widen = max(widen, self.regime_spread_widen * 0.9)
+            lean += whale_shadow * 0.5
+            tag = "whale-burst"
+
+        return {"tag": tag, "widen": widen, "lean": lean}
+
     def _should_pause_quotes(self, metrics: Dict) -> Tuple[bool, Optional[str]]:
         volatility = metrics.get("volatility", 0.0)
         trend = abs(metrics.get("micro_trend", 0.0))
@@ -428,17 +471,20 @@ class SimpleMarketMaker:
         social_buzz = metrics.get("social_buzz", 0.0)
         whale_pressure = metrics.get("whale_pressure", 0.0)
         whale_shadow = metrics.get("whale_shadow_bias", 0.0)
+        regime = self._detect_regime(metrics)
 
         base_half *= 1 + social_buzz * 0.1
         base_half *= 1 + whale_pressure * self.whale_pressure_widen
         base_half *= 1 + abs(whale_shadow) * 0.1
+        base_half *= 1 + regime.get("widen", 0.0)
 
         sentiment_skew = social_sentiment * self.social_sentiment_bias * base_half * 0.5
         shadow_skew = whale_shadow * base_half * 0.35
+        regime_skew = regime.get("lean", 0.0) * base_half * 0.5
 
         skew = metrics.get("imbalance", 0.0) * self.inventory_skew * base_half
-        my_bid = round(mid - base_half - skew - trend_skew + sentiment_skew + shadow_skew, 3)
-        my_ask = round(mid + base_half - skew - trend_skew + sentiment_skew + shadow_skew, 3)
+        my_bid = round(mid - base_half - skew - trend_skew + sentiment_skew + shadow_skew + regime_skew, 3)
+        my_ask = round(mid + base_half - skew - trend_skew + sentiment_skew + shadow_skew + regime_skew, 3)
 
         if my_bid <= 0 or my_ask >= 1.0 or my_bid >= my_ask:
             return None
@@ -464,6 +510,9 @@ class SimpleMarketMaker:
         whale_edge = min(1.0, metrics.get("whale_pressure", 0.0)) * 0.05
         shadow_edge = min(1.0, abs(metrics.get("whale_shadow_bias", 0.0))) * 0.06
 
+        regime = self._detect_regime(metrics)
+        regime_edge = 0.05 if regime.get("tag") != "normal" else 0.0
+
         heuristic_score = round(
             spread_edge
             + imbalance_edge
@@ -475,16 +524,19 @@ class SimpleMarketMaker:
             + sentiment_edge
             + buzz_edge
             + whale_edge
-            + shadow_edge,
+            + shadow_edge
+            + regime_edge,
             3,
         )
 
         ml_score = 0.0
+        ml_conf = 0.0
         if self.signal_model:
             ml_features = self._build_ml_features(metrics)
-            ml_score = self.signal_model.predict(ml_features)
+            ml_score, ml_conf = self.signal_model.predict_with_confidence(ml_features)
 
-        combo = heuristic_score * (1 - self.ml_edge_weight) + ml_score * self.ml_edge_weight
+        effective_weight = self.ml_edge_weight * max(self.ml_confidence_floor, ml_conf)
+        combo = heuristic_score * (1 - effective_weight) + ml_score * effective_weight
         return round(min(1.0, combo), 3)
 
     def _build_ml_features(self, metrics: Dict) -> Dict[str, float]:
@@ -513,6 +565,7 @@ class SimpleMarketMaker:
                 continue
 
             mechanics = []
+            regime = self._detect_regime(metrics)
             if metrics["wide_spread"]:
                 mechanics.append("inside-spread capture")
             if abs(metrics["imbalance"]) >= 0.25:
@@ -537,6 +590,12 @@ class SimpleMarketMaker:
                 mechanics.append("whale shadowing")
             if abs(metrics.get("whale_shadow_bias", 0.0)) >= 0.3:
                 mechanics.append("alpha wallet shadow")
+            if regime.get("tag") == "whale-burst":
+                mechanics.append("whale burst chase")
+            if regime.get("tag") == "social-buzz":
+                mechanics.append("buzz echo capture")
+            if regime.get("tag") in {"volatile", "drifting"}:
+                mechanics.append("regime-aware sheltering")
             if self.signal_model and self.signal_model.ready:
                 mechanics.append("ml edge confirmation")
 
