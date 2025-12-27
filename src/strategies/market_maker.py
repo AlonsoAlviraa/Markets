@@ -634,8 +634,19 @@ class SimpleMarketMaker:
         regime_skew = regime.get("lean", 0.0) * base_half * 0.5
 
         skew = metrics.get("imbalance", 0.0) * self.inventory_skew * base_half
-        my_bid = round(mid - base_half - skew - trend_skew + sentiment_skew + shadow_skew + regime_skew, 3)
-        my_ask = round(mid + base_half - skew - trend_skew + sentiment_skew + shadow_skew + regime_skew, 3)
+
+        # Position Management (Inventory Skew)
+        current_pos = 0.0
+        if self.dry_run:
+            current_pos = self.paper_positions.get(token_id, 0.0)
+        elif self.executor:
+            current_pos = self.executor.get_token_balance(token_id)
+        
+        # Shift 0.0001 per share held (e.g. +100 shares -> -0.01 price shift -> Sell harder)
+        inventory_skew_term = current_pos * 0.0001 
+        
+        my_bid = round(mid - base_half - skew - trend_skew + sentiment_skew + shadow_skew + regime_skew - inventory_skew_term, 3)
+        my_ask = round(mid + base_half - skew - trend_skew + sentiment_skew + shadow_skew + regime_skew - inventory_skew_term, 3)
 
         if my_bid <= 0 or my_ask >= 1.0 or my_bid >= my_ask:
             return None

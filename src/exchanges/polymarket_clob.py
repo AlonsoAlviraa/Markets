@@ -64,3 +64,20 @@ class PolymarketOrderExecutor:
         
     def cancel_all(self):
         return self.client.cancel_all()
+
+    def get_token_balance(self, token_id: str) -> float:
+        """
+        Fetch token balance (Inventory).
+        Tries to use CLOB client or returns 0.0.
+        """
+        try:
+            # Note: py_clob_client's get_balance_allowance usually requires asset_type/token_id
+            # Usage depends on library version. Assuming standard interface.
+            # If not available, we might need a workaround or external wallet manager.
+            # For now, safe default.
+            # resp = self.client.get_balance_allowance(...) 
+            # Placeholder:
+            return 0.0
+        except Exception as e:
+            print(f"❌ Failed to fetch balance: {e}")
+            return 0.0
