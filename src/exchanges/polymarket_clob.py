@@ -20,7 +20,7 @@ class PolymarketOrderExecutor:
             host=self.host,
             key=self.key,
             chain_id=self.chain_id,
-            signature_type=2 # 1 for EOA (usually), 2 for PolyProxy? Need to verify default.
+            # signature_type=2 # Removed to allow auto-detection (Default is EOA)
                              # Standard py-clob-client uses signature_type=None by default which auto-detects or defaults to 1?
                              # Let's try default first.
         )

@@ -28,7 +28,7 @@ class WalletManager:
         self.web3_polygon = Web3(Web3.HTTPProvider(self.polygon_rpc))
         self.web3_sx = Web3(Web3.HTTPProvider(self.sx_rpc))
         
-        print(f"✅ Wallet initialized: {self.address}")
+        print(f"[OK] Wallet initialized: {self.address}")
         print(f"   Polygon connected: {self.web3_polygon.is_connected()}")
         print(f"   SX Network connected: {self.web3_sx.is_connected()}")
     
@@ -39,7 +39,7 @@ class WalletManager:
         # USDC contract addresses
         # USDC contract addresses (Updated with verified addresses)
         usdc_addresses = {
-            "polygon": "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359",  # Native USDC on Polygon
+            "polygon": "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174",  # Bridged USDC (USDC.e) - Polymarket Standard
             "sx": "0x6629Ce1Cf35Cc1329ebB4F63202F3f197b3F050B"  # USDC on SX Rollup (verified)
         }
         
