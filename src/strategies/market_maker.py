@@ -1,6 +1,6 @@
 import asyncio
 import logging
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import aiohttp
 
@@ -27,18 +27,27 @@ class SimpleMarketMaker:
         dry_run: bool = True,
         spread: float = 0.02,
         size: float = 10.0,
+        inside_spread_ratio: float = 0.5,
+        inventory_skew: float = 0.05,
+        wide_spread_threshold: float = 0.04,
+        opportunity_score_threshold: float = 0.6,
     ):
         self.token_ids = token_ids
         self.executor = executor
         self.dry_run = dry_run
         self.spread = spread  # 2 cents spread by default
         self.size = size
+        self.inside_spread_ratio = inside_spread_ratio
+        self.inventory_skew = inventory_skew
+        self.wide_spread_threshold = wide_spread_threshold
+        self.opportunity_score_threshold = opportunity_score_threshold
         self.books: Dict[str, OrderBook] = {tid: OrderBook(tid) for tid in token_ids}
         self.feed = MarketDataFeed()
         self.feed.add_callback(self.on_market_update)
 
         # Track our open orders: TokenID -> {'BID': order_id, 'ASK': order_id}
         self.active_orders: Dict[str, Dict[str, str]] = {tid: {} for tid in token_ids}
+        self.last_mid: Dict[str, float] = {}
 
     async def start(self):
         logger.info(
@@ -134,22 +143,114 @@ class SimpleMarketMaker:
         if mid:
             asyncio.create_task(self.update_quotes(token_id, mid, book))
 
-    async def update_quotes(self, token_id: str, mid: float, book: OrderBook):
-        # Desired Bid/Ask
-        my_bid = round(mid - (self.spread / 2), 3)
-        my_ask = round(mid + (self.spread / 2), 3)
+    def compute_book_metrics(self, token_id: str, book: Optional[OrderBook] = None) -> Dict:
+        book = book or self.books[token_id]
+        bb, _ = book.get_best_bid()
+        ba, _ = book.get_best_ask()
+        mid = book.get_mid_price()
+        spread = book.get_spread()
+
+        bid_depth = sum(book.bids.values())
+        ask_depth = sum(book.asks.values())
+        total_depth = bid_depth + ask_depth
+        imbalance = 0.0
+        if total_depth > 0:
+            imbalance = (bid_depth - ask_depth) / total_depth
+
+        prev_mid = self.last_mid.get(token_id, mid or 0.0)
+        mid_change = (mid or prev_mid) - prev_mid
+        metrics = {
+            "mid": mid,
+            "spread": spread,
+            "bid_depth": bid_depth,
+            "ask_depth": ask_depth,
+            "imbalance": imbalance,
+            "wide_spread": bool(spread is not None and spread >= self.wide_spread_threshold),
+            "mid_change": mid_change,
+        }
+
+        if mid is not None:
+            self.last_mid[token_id] = mid
+
+        return metrics
+
+    def _generate_quote_prices(
+        self, token_id: str, mid: float, book: OrderBook, metrics: Optional[Dict] = None
+    ) -> Optional[Tuple[float, float]]:
+        metrics = metrics or self.compute_book_metrics(token_id, book)
+        bb, _ = book.get_best_bid()
+        ba, _ = book.get_best_ask()
+
+        if bb is None or ba is None:
+            return None
+
+        base_half = max(0.001, self.spread / 2)
+        if metrics.get("wide_spread") and metrics.get("spread"):
+            base_half = min(base_half, metrics["spread"] * self.inside_spread_ratio / 2)
+
+        skew = metrics.get("imbalance", 0.0) * self.inventory_skew * base_half
+        my_bid = round(mid - base_half - skew, 3)
+        my_ask = round(mid + base_half - skew, 3)
 
         if my_bid <= 0 or my_ask >= 1.0 or my_bid >= my_ask:
+            return None
+
+        my_bid = min(my_bid, ba - 0.001)
+        my_ask = max(my_ask, bb + 0.001)
+
+        return my_bid, my_ask
+
+    def _score_opportunity(self, metrics: Dict) -> float:
+        spread_edge = 0.0
+        if metrics.get("spread"):
+            spread_edge = min(1.0, metrics["spread"] / max(self.spread, 0.001)) * 0.5
+
+        imbalance_edge = min(1.0, abs(metrics.get("imbalance", 0.0))) * 0.3
+        momentum_edge = min(1.0, abs(metrics.get("mid_change", 0.0))) * 0.2
+
+        return round(spread_edge + imbalance_edge + momentum_edge, 3)
+
+    def find_opportunities(self) -> List[Dict]:
+        """Rank tokens with actionable mechanics (wide spread, imbalance, or drift)."""
+
+        ranked: List[Dict] = []
+        for token_id, book in self.books.items():
+            metrics = self.compute_book_metrics(token_id, book)
+            if metrics["mid"] is None or metrics["spread"] is None:
+                continue
+
+            score = self._score_opportunity(metrics)
+            if score < self.opportunity_score_threshold:
+                continue
+
+            mechanics = []
+            if metrics["wide_spread"]:
+                mechanics.append("inside-spread capture")
+            if abs(metrics["imbalance"]) >= 0.25:
+                mechanics.append("inventory skew")
+            if abs(metrics["mid_change"]) >= 0.005:
+                mechanics.append("micro-momentum follow")
+
+            ranked.append({
+                "token_id": token_id,
+                "score": score,
+                "mechanics": mechanics or ["steady alpha harvesting"],
+                "metrics": metrics,
+            })
+
+        return sorted(ranked, key=lambda r: r["score"], reverse=True)
+
+    async def update_quotes(self, token_id: str, mid: float, book: OrderBook):
+        metrics = self.compute_book_metrics(token_id, book)
+        quote = self._generate_quote_prices(token_id, mid, book, metrics)
+        if not quote:
             return
 
+        my_bid, my_ask = quote
         bb, _ = book.get_best_bid()
         ba, _ = book.get_best_ask()
         if bb is None or ba is None:
             return
-
-        # Avoid crossing the book and leave a small buffer inside the spread
-        my_bid = min(my_bid, ba - 0.001)
-        my_ask = max(my_ask, bb + 0.001)
 
         log_msg = (
             f"[QUOTE] {token_id[:10]}... | Mid: {mid:.3f} | "
