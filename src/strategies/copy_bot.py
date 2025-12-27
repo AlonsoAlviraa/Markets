@@ -46,12 +46,15 @@ class CopyBot:
         try:
             new_whales = await self.hunter.fetch_top_whales()
             if new_whales:
-                addresses = [w['address'] for w in new_whales]
                 # Merge with config whales
-                for addr in addresses:
+                for w in new_whales:
+                    addr = w['address']
                     if addr.lower() not in [t.lower() for t in self.target_wallets]:
                         self.target_wallets.append(addr)
-                        logger.info(f"[COPY] ➕ Added new Alpha Wallet: {addr[:6]}... ({w['name']})")
+                        # Log to MegaDebugger
+                        from src.utils.mega_debugger import MegaDebugger
+                        print(f"{MegaDebugger.OKGREEN}[COPY] ➕ Added new Alpha Wallet: {addr[:6]}... ({w['name']}){MegaDebugger.ENDC}")
+                        logger.info(f"[COPY] Added {addr}")
                 
                 # Update Spy
                 self.spy.targets = [t.lower() for t in self.target_wallets]

@@ -1,9 +1,9 @@
 
-import asyncio
 import logging
 import aiohttp
 from typing import List, Callable, Dict
 import time
+from config import POLYGONSCAN_API_KEY
 
 logger = logging.getLogger(__name__)
 
@@ -15,10 +15,10 @@ class PolygonSpy:
 
     BASE_URL = "https://api.polygonscan.com/api"
     
-    def __init__(self, target_wallets: List[str], callback: Callable[[Dict], None], api_key: str = "YourApiKeyToken"):
+    def __init__(self, target_wallets: List[str], callback: Callable[[Dict], None], api_key: str = None):
         self.targets = [t.lower() for t in target_wallets]
         self.callback = callback
-        self.api_key = api_key
+        self.api_key = api_key or POLYGONSCAN_API_KEY
         self.last_block = 0
         self.is_running = False
 
