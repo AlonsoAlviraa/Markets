@@ -273,6 +273,23 @@ class AutomatedArbitrageBot:
             else:
                 print("❌ Could not find token for Market Making.")
 
+        # Initialize Copy Bot (Phase 6)
+        self.copy_bot = None
+        if self.clob_executor: 
+            # Import here to avoid circular deps if any
+            from src.strategies.copy_bot import CopyBot
+            from config import WHALE_WALLETS
+            
+            if WHALE_WALLETS:
+               print(f"🐋 Starting CopyBot (Spy Network) for {len(WHALE_WALLETS)} whales...")
+               self.copy_bot = CopyBot(WHALE_WALLETS, self.clob_executor)
+               # Start as task
+               asyncio.create_task(self.copy_bot.start())
+            else:
+               print("⚠️ CopyBot enabled but NO whales configured in config.py")
+
+
+
         try:
             while True:
                 await self.run_scan_cycle()
