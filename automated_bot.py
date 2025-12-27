@@ -11,6 +11,7 @@ from src.strategies.atomic_arbitrage import AtomicArbitrageScanner
 from src.core.atomic_executor import AtomicExecutor
 from src.exchanges.polymarket_clob import PolymarketOrderExecutor
 from src.strategies.market_maker import SimpleMarketMaker
+from src.core.risk import CanaryGuard, DrawdownGuard, OperationalCircuitBreaker
 from src.wallet.wallet_manager import WalletManager
 from src.utils.telegram_bot import TelegramBot
 from dotenv import load_dotenv
@@ -280,11 +281,19 @@ class AutomatedArbitrageBot:
                     if self.telegram:
                         await self.telegram.send_message(msg)
 
+                # Initialize Risk Guards
+                circuit_breaker = OperationalCircuitBreaker()
+                canary_guard = CanaryGuard()
+                drawdown_guard = DrawdownGuard()
+
                 self.market_maker = SimpleMarketMaker(
                     token_ids=[str(token_id)],
                     executor=self.clob_executor,
                     dry_run=self.mm_dry_run,
-                    telegram_callback=telegram_cb
+                    telegram_callback=telegram_cb,
+                    circuit_breaker=circuit_breaker,
+                    canary_guard=canary_guard,
+                    drawdown_guard=drawdown_guard
                 )
                 mm_task = asyncio.create_task(self.market_maker.start())
             else:

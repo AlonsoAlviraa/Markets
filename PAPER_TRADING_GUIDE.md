@@ -32,29 +32,25 @@ python automated_bot.py
 # "📝 PAPER TRADE SIMULATION"
 ```
 
-## 📊 Monitorear
+## 📊 New Dashboard (Premium)
 
-El bot escribe cada trade a `simulation_results.csv`:
-```csv
-Timestamp,Event,Strategy,Position_Size,Expected_Profit,Actual_Profit_After_Costs,Virtual_Balance,ROI_Percent
-2025-12-05T18:00:00,Bitcoin > 100k,Buy Poly YES Sell SX YES,100,5.00,2.85,502.85,2.85
-```
-
-## 🔍 Analizar Resultados
+Now you can visualize your paper trading performance with the new Premium Dashboard:
 
 ```bash
-# Después de 6-48 horas
-python analyze_simulation.py
+# 1. Run simulation
+python scripts/simulate_paper_session.py
 
-# Output:
-# 📊 PAPER TRADING ANALYSIS
-# ==================
-# Total Trades: 24
-# Win Rate: 87.5%
-# ROI: 45.2%
-# Trades/Day: 12
-# Projected Monthly: $678
+# 2. Generate Dashboard
+python src/utils/dashboard_generator.py
+
+# 3. Open 'data/paper_metrics/dashboard.html' in your browser
 ```
+
+The dashboard includes:
+- 📈 **Equity Curve**: Visualize your PnL over time.
+- 📉 **Drawdown Tracker**: Monitor max usage of your capital.
+- 🚨 **Canary Blocks**: See where the circuit breakers triggered.
+
 
 ## ✅ Validación Checklist
 
