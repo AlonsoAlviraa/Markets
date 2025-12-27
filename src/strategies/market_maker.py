@@ -62,6 +62,11 @@ class SimpleMarketMaker:
         self.active_orders: Dict[str, Dict[str, str]] = {tid: {} for tid in token_ids}
         self.last_mid: Dict[str, float] = {}
 
+from src.utils.notifier import send_telegram_alert
+
+class SimpleMarketMaker:
+    # ... (init remains same)
+
     async def start(self):
         logger.info(
             "[START] Starting Market Maker for %s tokens... (Dry Run: %s)",
@@ -83,12 +88,23 @@ class SimpleMarketMaker:
             if opps:
                 top = opps[:3]
                 for op in top:
-                    logger.info(
-                        "[OPP] Token %s... | Score: %.2f | Mechanics: %s",
-                        op['token_id'][:8],
-                        op['score'],
-                        ", ".join(op['mechanics'])
-                    )
+                    log_msg = f"[OPP] Token {op['token_id'][:8]}... | Score: {op['score']:.2f} | Mechanics: {', '.join(op['mechanics'])}"
+                    logger.info(log_msg)
+                    
+                    # ALERT TO TELEGRAM (Engagement Fix)
+                    if op['score'] >= 0.7:
+                        tg_msg = (
+                            f"🎯 **MM Opportunity Detected**\n"
+                            f"Token: `{op['token_id'][:15]}...`\n"
+                            f"Score: **{op['score']:.2f}**\n"
+                            f"Mechanics: _{', '.join(op['mechanics'])}_\n"
+                            f"Vol: {op['metrics'].get('volatility', 0):.4f}"
+                        )
+                        try:
+                            # Run in executor to avoid blocking loop
+                            await asyncio.get_running_loop().run_in_executor(None, send_telegram_alert, tg_msg)
+                        except Exception:
+                            logger.error("Failed to send TG alert", exc_info=True)
 
     async def fetch_initial_book(self):
         """Fetch REST snapshot to initialize books."""
