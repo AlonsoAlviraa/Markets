@@ -231,11 +231,22 @@ class AutomatedArbitrageBot:
             # 2. Scanner Inter-Exchange
             print("\n🔍 Scanning for Inter-Exchange Arbitrage...")
             opportunities = await self.detector.scan_for_opportunities()
+            
+            # MEGA DEBUGGER HOOK
+            from src.utils.mega_debugger import MegaDebugger
             for opp in opportunities:
+                # Log to Mega Debugger
+                MegaDebugger.log_market_check(
+                    market_title=opp['poly_event']['title'],
+                    spread=0.0, # N/A for Detector currently
+                    profit=opp['profit_percent'],
+                    source="Polymarket+SX"
+                )
                 await self.notify_opportunity(opp)
             
             if not opportunities and not atomic_opps:
-                print("   No opportunities found this cycle.")
+                 MegaDebugger.log_status(f"Scan Complete. Clean Cycle.")
+                 print("   No opportunities found this cycle.")
         
         except Exception as e:
             print(f"❌ Scan cycle error: {e}")
@@ -280,13 +291,15 @@ class AutomatedArbitrageBot:
             from src.strategies.copy_bot import CopyBot
             from config import WHALE_WALLETS
             
+            # Start CopyBot even if WHALE_WALLETS is empty (Auto-Discovery)
+            print(f"🐋 Starting CopyBot (Spy Network)...")
             if WHALE_WALLETS:
-               print(f"🐋 Starting CopyBot (Spy Network) for {len(WHALE_WALLETS)} whales...")
-               self.copy_bot = CopyBot(WHALE_WALLETS, self.clob_executor)
-               # Start as task
-               asyncio.create_task(self.copy_bot.start())
+                print(f"   Tracking {len(WHALE_WALLETS)} static whales from config.")
             else:
-               print("⚠️ CopyBot enabled but NO whales configured in config.py")
+                print(f"   No static whales. Relying on Auto-Discovery (WhaleHunter).")
+
+            self.copy_bot = CopyBot(WHALE_WALLETS, self.clob_executor)
+            asyncio.create_task(self.copy_bot.start())
 
 
 

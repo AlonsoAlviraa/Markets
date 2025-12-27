@@ -81,7 +81,11 @@ class CopyBot:
         amount = trade['amount']
         
         # Log and Alert
-        logger.info(f"[COPY] 🎯 MATCH: {wallet[:6]} {side} {token_id} (Amt: {amount})")
+        # logger.info(f"[COPY] 🎯 MATCH: {wallet[:6]} {side} {token_id} (Amt: {amount})")
+
+        # Mega Debugger Hook
+        from src.utils.mega_debugger import MegaDebugger
+        MegaDebugger.log_whale_activity(wallet, side, token_id, amount)
         
         msg = (
             f"🐋 **WHALE ALERT**\n"
@@ -92,3 +96,4 @@ class CopyBot:
             f"🔗 [View TX](https://polygonscan.com/tx/{trade['tx_hash']})"
         )
         send_telegram_alert(msg)
+        MegaDebugger.log_alert_sent("TELEGRAM", msg)
