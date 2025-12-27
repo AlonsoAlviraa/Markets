@@ -2,12 +2,20 @@ import asyncio
 import logging
 import math
 from collections import deque
+from datetime import datetime
 from typing import Deque, Dict, List, Optional, Tuple
 
 import aiohttp
 
 from src.core.feed import MarketDataFeed
 from src.core.orderbook import OrderBook
+from src.core.performance import (
+    AdaptiveQuoteController,
+    ExecutionHealth,
+    ExecutionQualityMonitor,
+    QuoteAdjustment,
+)
+from src.core.risk import CanaryGuard, DrawdownGuard, OperationalCircuitBreaker
 from src.exchanges.polymarket_clob import PolymarketOrderExecutor
 
 logger = logging.getLogger(__name__)
@@ -37,6 +45,9 @@ class SignalEnsembler:
             "whale_pressure": 0.12,
             "social_buzz": 0.05,
             "whale_shadow_bias": 0.1,
+            "book_skew": 0.05,
+            "time_since_last_fill": 0.04,
+            "social_burst_ratio": 0.05,
         }
         self.bias = bias
         self.learning_rate = learning_rate
@@ -90,6 +101,14 @@ class SignalEnsembler:
     def ready(self) -> bool:
         return self.trained_samples >= self.min_fit_samples
 
+    def set_regime(self, regime_tag: str) -> None:
+        """Adjust decay depending on the detected regime."""
+
+        if regime_tag == "volatile":
+            self.decay = 0.93
+        else:
+            self.decay = 0.97
+
 
 class SimpleMarketMaker:
     """
@@ -124,6 +143,12 @@ class SimpleMarketMaker:
         ml_confidence_floor: float = 0.2,
         regime_spread_widen: float = 0.15,
         signal_model: Optional[SignalEnsembler] = None,
+        circuit_breaker: Optional[OperationalCircuitBreaker] = None,
+        canary_guard: Optional[CanaryGuard] = None,
+        performance_tuner: Optional[AdaptiveQuoteController] = None,
+        execution_monitor: Optional[ExecutionQualityMonitor] = None,
+        drawdown_guard: Optional[DrawdownGuard] = None,
+        stale_quote_seconds: float = 5.0,
     ):
         self.token_ids = token_ids
         self.executor = executor
@@ -147,6 +172,11 @@ class SimpleMarketMaker:
         self.ml_confidence_floor = ml_confidence_floor
         self.regime_spread_widen = regime_spread_widen
         self.signal_model = signal_model or SignalEnsembler()
+        self.operational_circuit = circuit_breaker
+        self.canary_guard = canary_guard
+        self.drawdown_guard = drawdown_guard
+        self.performance_tuner = performance_tuner or AdaptiveQuoteController()
+        self.execution_monitor = execution_monitor or ExecutionQualityMonitor()
         self.books: Dict[str, OrderBook] = {tid: OrderBook(tid) for tid in token_ids}
         self.feed = MarketDataFeed()
         self.feed.add_callback(self.on_market_update)
@@ -157,11 +187,20 @@ class SimpleMarketMaker:
         self.mid_history: Dict[str, Deque[float]] = {
             tid: deque(maxlen=self.volatility_window) for tid in token_ids
         }
+        self.last_book_update: Dict[str, datetime] = {tid: datetime.utcnow() for tid in token_ids}
         self.social_signals: Dict[str, Dict[str, float]] = {
             tid: {"sentiment": 0.0, "buzz": 0.0, "whale_pressure": 0.0}
             for tid in token_ids
         }
         self.whale_heat: Dict[str, Deque[float]] = {tid: deque(maxlen=50) for tid in token_ids}
+        self.prev_social_buzz: Dict[str, float] = {tid: 0.0 for tid in token_ids}
+        self.last_fill_time: Dict[str, datetime] = {}
+        self.quote_adjustments: Dict[str, QuoteAdjustment] = {tid: QuoteAdjustment() for tid in token_ids}
+        self.execution_health: Dict[str, ExecutionHealth] = {tid: ExecutionHealth() for tid in token_ids}
+        self.api_requests = 0
+        self.api_errors = 0
+        self.feed_latency_ms = 0.0
+        self.stale_quote_seconds = stale_quote_seconds
 
     async def start(self):
         logger.info(
@@ -237,6 +276,20 @@ class SimpleMarketMaker:
         }
         self.social_signals[token_id].update(sanitized)
 
+    def record_api_call(self, success: bool, latency_ms: float = 0.0) -> None:
+        """Track error-rate and latency for circuit breaker decisions."""
+
+        self.api_requests += 1
+        if not success:
+            self.api_errors += 1
+        self.feed_latency_ms = latency_ms
+
+    @property
+    def api_error_rate(self) -> float:
+        if self.api_requests == 0:
+            return 0.0
+        return self.api_errors / max(self.api_requests, 1)
+
     def record_whale_action(
         self,
         token_id: str,
@@ -260,6 +313,45 @@ class SimpleMarketMaker:
 
         whale_pressure = max(0.0, sum(self.whale_heat[token_id]) / len(self.whale_heat[token_id]))
         self.social_signals[token_id]["whale_pressure"] = whale_pressure
+
+    def record_fill(
+        self,
+        token_id: str,
+        side: str,
+        price: float,
+        size: float,
+        pnl: float = 0.0,
+    ) -> Optional[str]:
+        """Register a fill to feed canary guardrails and ML features."""
+
+        self.last_fill_time[token_id] = datetime.utcnow()
+
+        if self.performance_tuner:
+            notional = max(price * size, 0.0)
+            slippage_ratio = abs(pnl) / notional if notional else 0.0
+            self.performance_tuner.record_fill(
+                token_id, latency_ms=self.feed_latency_ms, slippage=slippage_ratio
+            )
+
+        if self.execution_monitor:
+            self.execution_monitor.record_fill(
+                token_id,
+                pnl=pnl,
+                latency_ms=self.feed_latency_ms,
+                slippage=abs(pnl) / max(price * size, 1e-6) if price and size else 0.0,
+            )
+
+        if self.canary_guard:
+            violation = self.canary_guard.register_fill(token_id, price * size, pnl)
+            if violation:
+                logger.warning("[CANARY] Block due to %s on %s", violation, token_id)
+            return violation
+        if self.drawdown_guard:
+            violation = self.drawdown_guard.register_fill(pnl)
+            if violation:
+                logger.warning("[DRAWDOWN] Limit reached: %s", violation)
+            return violation
+        return None
 
     def train_signal_model(self, labeled_samples: List[Dict[str, Dict[str, float]]]) -> None:
         """Allow external processes to fit the online ensembler."""
@@ -288,6 +380,7 @@ class SimpleMarketMaker:
             book.update("SELL", float(ask["price"]), float(ask["size"]))
 
         mid = book.get_mid_price()
+        self.last_book_update[token_id] = datetime.utcnow()
         if mid:
             await self.update_quotes(token_id, mid, book)
 
@@ -306,6 +399,7 @@ class SimpleMarketMaker:
 
         book = self.books[token_id]
         book.update(side, price, size)
+        self.last_book_update[token_id] = datetime.utcnow()
 
         mid = book.get_mid_price()
         if mid:
@@ -339,7 +433,16 @@ class SimpleMarketMaker:
         social = self.social_signals.get(
             token_id, {"sentiment": 0.0, "buzz": 0.0, "whale_pressure": 0.0}
         )
+        prev_buzz = self.prev_social_buzz.get(token_id, 0.0)
+        social_burst_ratio = 0.0
+        if prev_buzz > 0:
+            social_burst_ratio = max(0.0, (social.get("buzz", 0.0) - prev_buzz) / max(prev_buzz, 0.1))
+        self.prev_social_buzz[token_id] = social.get("buzz", 0.0)
         whale_shadow = self._compute_whale_shadow(token_id)
+        last_fill_at = self.last_fill_time.get(token_id)
+        time_since_last_fill = (
+            (datetime.utcnow() - last_fill_at).total_seconds() if last_fill_at else float("inf")
+        )
         metrics = {
             "mid": mid,
             "spread": spread,
@@ -356,6 +459,8 @@ class SimpleMarketMaker:
             "social_buzz": social.get("buzz", 0.0),
             "whale_pressure": social.get("whale_pressure", 0.0),
             "whale_shadow_bias": whale_shadow,
+            "time_since_last_fill": time_since_last_fill,
+            "social_burst_ratio": social_burst_ratio,
         }
 
         return metrics
@@ -433,12 +538,26 @@ class SimpleMarketMaker:
         if extreme_trend:
             return True, "trend"
 
+        if self.operational_circuit:
+            cb_status = self.operational_circuit.evaluate(
+                volatility=volatility,
+                baseline_volatility=self.volatility_threshold,
+                error_rate=self.api_error_rate,
+                latency_ms=self.feed_latency_ms,
+            )
+            if cb_status.active:
+                return True, f"circuit_breaker:{cb_status.reason}"
+
         return False, None
 
     def _generate_quote_prices(
         self, token_id: str, mid: float, book: OrderBook, metrics: Optional[Dict] = None
     ) -> Optional[Tuple[float, float]]:
         metrics = metrics or self.compute_book_metrics(token_id, book)
+        last_update = self.last_book_update.get(token_id, datetime.utcnow())
+        if (datetime.utcnow() - last_update).total_seconds() > self.stale_quote_seconds:
+            logger.info("[PAUSE] Stale book for %s; skipping quotes", token_id)
+            return None
         should_pause, pause_reason = self._should_pause_quotes(metrics)
         if should_pause:
             logger.info(
@@ -463,6 +582,28 @@ class SimpleMarketMaker:
         if volatility > self.volatility_threshold:
             vol_ratio = min(3.0, (volatility - self.volatility_threshold) / max(self.volatility_threshold, 1e-6))
             base_half *= 1 + vol_ratio * 0.15
+
+        adjustment = QuoteAdjustment()
+        if self.performance_tuner:
+            adjustment = self.performance_tuner.compute_adjustment(
+                token_id,
+                volatility=volatility,
+                latency_ms=self.feed_latency_ms,
+            )
+            base_half *= 1 + adjustment.spread_widen
+        self.quote_adjustments[token_id] = adjustment
+
+        health = None
+        if self.execution_monitor:
+            health = self.execution_monitor.evaluate(token_id)
+            self.execution_health[token_id] = health
+            if health.status == "halt":
+                logger.warning(
+                    "[QUALITY] Halting quotes for %s due to %s", token_id, health.reason
+                )
+                return None
+            if health.spread_penalty:
+                base_half *= 1 + health.spread_penalty
 
         trend_bias = metrics.get("micro_trend", 0.0)
         trend_skew = trend_bias * self.inside_spread_ratio * base_half
@@ -531,11 +672,17 @@ class SimpleMarketMaker:
 
         ml_score = 0.0
         ml_conf = 0.0
+        regime = self._detect_regime(metrics)
+        if self.signal_model:
+            self.signal_model.set_regime(regime.get("tag"))
         if self.signal_model:
             ml_features = self._build_ml_features(metrics)
             ml_score, ml_conf = self.signal_model.predict_with_confidence(ml_features)
 
-        effective_weight = self.ml_edge_weight * max(self.ml_confidence_floor, ml_conf)
+        whale_pressure = metrics.get("whale_pressure", 0.0)
+        whale_gate = 1.2 if whale_pressure >= 0.55 else 0.6
+        effective_weight = self.ml_edge_weight * max(self.ml_confidence_floor, ml_conf) * whale_gate
+        effective_weight = min(0.95, effective_weight)
         combo = heuristic_score * (1 - effective_weight) + ml_score * effective_weight
         return round(min(1.0, combo), 3)
 
@@ -549,6 +696,9 @@ class SimpleMarketMaker:
             "whale_pressure": metrics.get("whale_pressure", 0.0),
             "social_buzz": metrics.get("social_buzz", 0.0),
             "whale_shadow_bias": metrics.get("whale_shadow_bias", 0.0),
+            "book_skew": metrics.get("imbalance", 0.0),
+            "time_since_last_fill": metrics.get("time_since_last_fill", 0.0),
+            "social_burst_ratio": metrics.get("social_burst_ratio", 0.0),
         }
 
     def find_opportunities(self) -> List[Dict]:
@@ -615,6 +765,10 @@ class SimpleMarketMaker:
             return
 
         my_bid, my_ask = quote
+        adjustment = self.quote_adjustments.get(token_id, QuoteAdjustment())
+        health = self.execution_health.get(token_id)
+        health_size_multiplier = health.size_multiplier if health else 1.0
+        quote_size = max(0.001, self.size * adjustment.size_multiplier * health_size_multiplier)
         bb, _ = book.get_best_bid()
         ba, _ = book.get_best_ask()
         if bb is None or ba is None:
@@ -628,10 +782,23 @@ class SimpleMarketMaker:
         if self.dry_run:
             logger.info("%s (DRY)", log_msg)
         else:
+            if self.canary_guard:
+                notional = max(mid, 0.0) * quote_size
+                violation = self.canary_guard.check_order(token_id, notional)
+                if violation:
+                    logger.warning("[CANARY] Skipping live quotes for %s due to %s", token_id, violation)
+                    return
+            if self.drawdown_guard:
+                violation = self.drawdown_guard.check_equity(self.drawdown_guard.current_equity)
+                if violation:
+                    logger.warning("[DRAWDOWN] Halting quotes for %s due to %s", token_id, violation)
+                    return
             logger.info("%s (LIVE)", log_msg)
-            await self.execute_quotes(token_id, my_bid, my_ask)
+            await self.execute_quotes(token_id, my_bid, my_ask, size=quote_size)
 
-    async def execute_quotes(self, token_id: str, bid_price: float, ask_price: float):
+    async def execute_quotes(
+        self, token_id: str, bid_price: float, ask_price: float, *, size: Optional[float] = None
+    ):
         """
         Cancel previous orders and place new ones.
         This is a naive implementation (Cancel-All-Replace).
@@ -653,11 +820,13 @@ class SimpleMarketMaker:
         if cancel_tasks:
             await asyncio.gather(*cancel_tasks, return_exceptions=True)
 
+        chosen_size = self.size if size is None else size
+
         bid_oid = await loop.run_in_executor(
-            None, self.executor.place_order, token_id, "BUY", bid_price, self.size
+            None, self.executor.place_order, token_id, "BUY", bid_price, chosen_size
         )
         ask_oid = await loop.run_in_executor(
-            None, self.executor.place_order, token_id, "SELL", ask_price, self.size
+            None, self.executor.place_order, token_id, "SELL", ask_price, chosen_size
         )
 
         self.active_orders[token_id] = {"BID": bid_oid, "ASK": ask_oid}

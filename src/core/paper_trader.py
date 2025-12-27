@@ -3,19 +3,26 @@ import os
 from datetime import datetime
 from typing import Dict, Optional
 
+from src.core.paper_metrics import PaperMetricsExporter
+
 class PaperTrader:
     """
     Paper trading simulator with realistic slippage and fees.
     Tracks virtual balance and logs all trades to CSV.
     """
     
-    def __init__(self, initial_capital: float = 500.0):
+    def __init__(
+        self,
+        initial_capital: float = 500.0,
+        metrics_exporter: Optional[PaperMetricsExporter] = None,
+    ):
         self.initial_capital = initial_capital
         self.virtual_balance = initial_capital
         self.trades_executed = 0
         self.total_profit = 0.0
         self.total_loss = 0.0
         self.log_file = os.getenv("PAPER_LOG_FILE", "simulation_results.csv")
+        self.metrics_exporter = metrics_exporter or PaperMetricsExporter()
         
         # Trading costs (realistic estimates)
         self.polymarket_fee = 0.02  # 2% on profits
@@ -134,6 +141,15 @@ class PaperTrader:
         print(f"Total Profit:       ${stats['total_profit']:.2f}")
         print(f"Total Loss:         ${stats['total_loss']:.2f}")
         print(f"{'='*60}\n")
+
+    def export_metrics_snapshot(self, positions: Optional[list] = None, filename: Optional[str] = None) -> str:
+        """Persist a snapshot of paper metrics and positions for monitoring."""
+
+        return self.metrics_exporter.export(
+            stats=self.get_stats(),
+            positions=positions or [],
+            filename=filename,
+        )
 
 if __name__ == "__main__":
     # Test paper trader

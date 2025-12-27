@@ -1,11 +1,15 @@
 import os
 import sys
 
+import asyncio
+from datetime import datetime, timedelta
+
 import pytest
 
 sys.path.append(os.path.abspath("."))
 
 from src.core.orderbook import OrderBook
+from src.core.performance import AdaptiveQuoteController
 from src.strategies.market_maker import SignalEnsembler, SimpleMarketMaker
 
 
@@ -280,6 +284,16 @@ def test_signal_ensembler_learns_from_labels():
     assert model.predict(bullish_features) > base_pred
 
 
+def test_stale_book_pauses_quotes():
+    maker = SimpleMarketMaker(["T"], dry_run=True, stale_quote_seconds=0.0)
+    book = build_book({0.49: 10}, {0.51: 10})
+    maker.books["T"] = book
+
+    maker.last_book_update["T"] = datetime.utcnow() - timedelta(seconds=5)
+    quote = maker._generate_quote_prices("T", book.get_mid_price(), book)
+    assert quote is None
+
+
 def test_whale_shadowing_feeds_ml_mechanics():
     base_maker = SimpleMarketMaker(["T"], dry_run=True, spread=0.02, inside_spread_ratio=0.5, ml_edge_weight=0.25)
     whale_maker = SimpleMarketMaker(
@@ -397,5 +411,46 @@ def test_ml_score_gated_until_confident():
     trained_score = maker._score_opportunity(baseline_metrics)
 
     assert trained_score > low_conf_score
+
+
+class _CaptureExecutor:
+    def __init__(self):
+        self.placed = []
+
+    def cancel_order(self, order_id):
+        return order_id
+
+    def place_order(self, token_id, side, price, size):
+        self.placed.append({"token": token_id, "side": side, "price": price, "size": size})
+        return f"{token_id}-{side}"
+
+
+def test_adaptive_tuner_scales_quote_size_and_spread():
+    tuner = AdaptiveQuoteController(target_fill_rate=0.4, volatility_threshold=0.002)
+    executor = _CaptureExecutor()
+    maker = SimpleMarketMaker(
+        ["T"],
+        executor=executor,
+        dry_run=False,
+        spread=0.02,
+        performance_tuner=tuner,
+        volatility_threshold=0.002,
+        risk_pause_vol_multiplier=10.0,
+        risk_pause_trend_multiplier=10.0,
+    )
+
+    # Strong fills should increase size and tighten spreads slightly
+    for _ in range(4):
+        tuner.record_fill("T", filled=True, latency_ms=60, slippage=0.0)
+
+    book = build_book({0.49: 20}, {0.51: 20})
+    maker.books["T"] = book
+
+    asyncio.run(maker.update_quotes("T", book.get_mid_price(), book))
+
+    assert executor.placed, "Orders should be placed with live executor"
+    sizes = {o["size"] for o in executor.placed}
+    assert all(size >= maker.size for size in sizes)
+    assert any(size > maker.size for size in sizes)
 
 
