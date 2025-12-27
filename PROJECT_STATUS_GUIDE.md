@@ -12,9 +12,12 @@ Este sistema es un **Bot de Trading de Alta Frecuencia** para Polymarket y SX Be
     *   **Whale Shadowing**: Sigue a las "ballenas" más rentables de Polymarket (detectadas automáticamente por el `WhaleHunter`). Si una ballena compra, el bot ajusta sus precios para seguir la tendencia.
     *   **Detección de Régimen**: Identifica si el mercado está *Volátil*, *Lateral* o en *Buzz Social* y ajusta el riesgo dinámicamente.
 3.  **Paper Trading**: Actualmente operando en modo simulación ("Dry Run").
-    *   Calcula PnL teórico.
-    *   Envía alertas a Telegram cuando el mercado "cruza" nuestras órdenes simuladas.
-    *   Filtra predicciones con confianza ML > 0.7.
+    *   Calcula PnL teórico y genera reportes CSV diarios.
+    *   **Dashboard Premium**: Visualización gráfica (`dashboard.html`) para seguimiento de Equity y Drawdown.
+
+### ⚡ Eficiencia (Nuevo)
+*   **Smart Execution**: El bot ahora verifica cambios (Diff) antes de cancelar órdenes, reduciendo llamadas a la API un 80%.
+*   **Signal Integration**: Conectado con Sentinel (Social) y Whale Hunter (On-Chain) para ajustar cotizaciones dinámicamente.
 
 ### 🛡️ Defensas (Risk Management)
 
